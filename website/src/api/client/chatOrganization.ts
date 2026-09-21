@@ -56,8 +56,10 @@ export function createChatOrganizationEndpoints({ post, del, patch, j, sessionKe
      *  whole list to the reorder endpoint, which applies it all-or-none under the
      *  folder-store lock, so a rejected write leaves the stored order untouched
      *  rather than half-applied (issue #10406). */
-    reorderChatFolders: (orders: { id: string; order: number }[]) =>
-      post('/api/chat/folders/reorder', { orders }).then(j),
+    reorderChatFolders: (orders: { id: string; order: number }[], expectedParent?: string) =>
+      // Empty string is a real claim (the root lane); only undefined means the
+      // caller makes no assumption about which container it computed against.
+      post('/api/chat/folders/reorder', expectedParent === undefined ? { orders } : { orders, expected_parent: expectedParent }).then(j),
     deleteChatFolder: (id: string) => del('/api/chat/folders/' + encodeURIComponent(id)).then(j),
     /** File a channel's EXISTING conversations into the folder its settings name.
      *
