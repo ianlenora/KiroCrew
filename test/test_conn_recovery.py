@@ -113,6 +113,12 @@ async def test_queue_dispatch_preserves_recovery_provenance(
         "_synthetic_payload": expected_recovery,
         "_directive_user_origin": False,
         "_directive_channel_origin": False,
+        # A recovery entry names no channel conversation, so the turn is told it
+        # is not a channel message (the refusal's attribution, not its authority):
+        # the drain always says which, so the runner never infers it from the
+        # authority flag -- and hands over the stamp it read, none here.
+        "_channel_message": False,
+        "_channel_recipient": None,
     }
     if expected_recovery:
         # A recovery-kind entry also tells the runner it IS a recovery
@@ -235,6 +241,8 @@ async def test_dispatch_classifies_the_payload_not_the_recovery(
         _synthetic_recovery_turn=True,
         _directive_user_origin=False,
         _directive_channel_origin=False,
+        _channel_message=False,
+        _channel_recipient=None,
     )
     # Provenance is unchanged by the split: either payload still renders as an
     # inject row, which is what stops the duplicate user bubble.

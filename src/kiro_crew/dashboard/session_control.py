@@ -772,6 +772,21 @@ def caller_slot_key(state: "DashboardState", session_key: str) -> str:
 MIRROR_IDENTITY_SEPARATOR = "|"
 
 
+def mirror_room(link: Any) -> str:
+    """One room of a :func:`_probe_channel_mirror` identity: ``type:channel:thread``.
+
+    The grammar the probe composes a non-Slack link with and :func:`mirror_audience`
+    splits, in one place, so a caller asking whether a particular conversation is
+    among the rooms right now (:func:`channel_recipient_released`) spells it the
+    way the probe does. Missing ids read as empty, never as ``None``.
+    """
+    return (
+        f"{getattr(link, 'channel_type', '')}"
+        f":{getattr(link, 'channel_id', '') or ''}"
+        f":{getattr(link, 'thread_id', '') or ''}"
+    )
+
+
 def _probe_channel_mirror(state: "DashboardState", slot: "_ChatSlot") -> str | None:
     """The identity of *slot*'s outbound channel mirror, ``""`` when the
     conversation is not mirrored, or ``None`` when the session store could not
@@ -846,11 +861,7 @@ def _probe_channel_mirror_for_key(state: "DashboardState", session_key: str) -> 
         return None
     parts: list[str] = []
     if link:
-        parts.append(
-            f"{getattr(link, 'channel_type', '')}"
-            f":{getattr(link, 'channel_id', '') or ''}"
-            f":{getattr(link, 'thread_id', '') or ''}"
-        )
+        parts.append(mirror_room(link))
     slack_identity = f"slack:{slack_channel}:{slack_thread}" if slack_thread else ""
     if slack_identity and slack_identity not in parts:
         parts.append(slack_identity)
@@ -1093,14 +1104,24 @@ QUEUED_CONTAINMENT_META_KEY = "queued_containment"
 SEND_ORIGIN_META_KEY = "send_origin_slot"
 
 # Queue-entry meta key naming the CHANNEL CONVERSATION that sent a message into a
-# resumed dashboard session mid-turn (``dashboard.channel_handoff``), so a
-# drain-time drop can be reported back into that conversation: the channel was
-# told "queued" at admission and, unlike a dashboard sender, reads neither the
-# target's transcript nor the SEL. Same reasoning as the sender stamp above for
-# why it is ``meta`` and how a requeued steer keeps it. It names a WRITE TARGET
-# on a network surface, so the restore path strips it like the sender stamp, and
-# the notice re-runs the outbound recipient authorization before it is sent.
+# resumed dashboard session mid-turn (``dashboard.channel_handoff``, and the Slack
+# linked-thread intercept for its own thread), so a drain-time drop can be
+# reported back into that conversation: the channel was told "queued" at
+# admission and, unlike a dashboard sender, reads neither the target's transcript
+# nor the SEL. Same reasoning as the sender stamp above for why it is ``meta``
+# and how a requeued steer keeps it. It names a WRITE TARGET on a network
+# surface, so the restore path strips it like the sender stamp -- and, unlike the
+# sender stamp, puts it back when the gateway's own seal over the record verifies
+# (``slot_queue_repository.restore_queue_provenance``) -- and the notice re-runs
+# the outbound recipient authorization before it is sent.
 CHANNEL_RECIPIENT_META_KEY = "channel_recipient"
+
+# The drain-time constraint recorded when the conversation that queued a stamped
+# entry does not resume the session any more: its binding was released
+# (``/unlink``, ``!new``) or moved to another conversation while the entry waited
+# (:func:`channel_recipient_released`). Named like the snapshot constraints so
+# the audit row and the notice read the same.
+CHANNEL_UNLINKED_CONSTRAINT = "unlinked"
 
 # How much of a dropped delivery's own text the sender's notice quotes back, so
 # a caller holding several deliveries in flight can tell which one went.
@@ -1116,6 +1137,27 @@ _CONTAINMENT_CHANGE_LABELS = {
     "app": "the session became app-scoped",
     "unattended": "the session became unattended",
     "workspace": "the session moved to a different workspace",
+    # Recorded by the drain for a channel hand-off (:data:`CHANNEL_UNLINKED_CONSTRAINT`,
+    # :func:`channel_recipient_released`), not by :func:`newly_held_constraints`: the
+    # conversation that queued the entry stopped resuming the session.
+    "unlinked": "the channel conversation that queued it left the session",
+    # Recorded by the drain for a restored entry (``slot_queue_repository.
+    # REJECTED_SEAL_CONSTRAINT``): the durable record it came back from carried
+    # provenance that was PRESENT AND FALSE against the write this gateway
+    # committed -- a seal, a generation or a whole line that is not what the
+    # gateway last wrote. Phrased, like every label here, as the clause both
+    # notice frames complete with "after it was queued, so ..." (``chat_runner``'s
+    # dashboard notice, :func:`notify_channel_recipient_dropped`'s channel one).
+    "seal_rejected": "its stored record was changed by something other than this gateway",
+    # Recorded by the drain for a restored entry (``slot_queue_repository.
+    # UNRECORDED_GENERATION_CONSTRAINT``): the line it came back from names a
+    # durable write the fenced store holds no record of for this transcript -- a
+    # save cut short before its generation landed, a transcript put back from a
+    # copy, a reused slot key. Nothing was altered, so this is not the tamper
+    # wording above; there is simply nothing this gateway can honour.
+    "generation_unrecorded": (
+        "this gateway kept no record of the durable write it was restored from"
+    ),
 }
 
 
@@ -1306,14 +1348,17 @@ def send_drop_excerpt(text: Any) -> str:
 
 
 def channel_recipient_meta(
-    channel_type: str, conversation_id: str, principal: str
+    channel_type: str, conversation_id: str, principal: str, thread_id: str = ""
 ) -> dict[str, Any]:
     """Queue-entry ``meta`` naming the channel conversation a message came FROM.
 
     Stamped by :func:`~kiro_crew.dashboard.channel_handoff.hand_to_resumed_slot`
     on both of its arms (the queue entry directly; the steer through its admission
-    dict, which the requeue copies onto the entry), so a drain-time drop can be
-    reported into that conversation (:func:`notify_channel_recipient_dropped`).
+    dict, which the requeue copies onto the entry), and by Slack's linked-thread
+    intercept for the thread it queues from, so a drain-time drop can be reported
+    into that conversation (:func:`notify_channel_recipient_dropped`) and the
+    drain can tell when that conversation stopped resuming the session
+    (:func:`channel_recipient_released`).
 
     *principal* is the platform user id the channel authorized on inbound. It
     rides along because the outbound recipient check needs one the SESSION KEY
@@ -1321,6 +1366,10 @@ def channel_recipient_meta(
     conversation id is unrelated to the user id its roster holds, so without it the
     notice would be refused as an unidentifiable recipient. Empty when the
     channel has none to give (a thread route answers on its conversation id).
+
+    *thread_id* is the thread inside the conversation, for a channel whose room is
+    a thread (a linked Slack thread); stamped only when non-empty, so a channel
+    with none keeps the three-field stamp.
 
     Empty when either address field is missing, and then nothing is stamped
     rather than a half-address: a stamp that cannot be delivered to must not
@@ -1330,13 +1379,14 @@ def channel_recipient_meta(
     conversation_id = str(conversation_id or "")
     if not channel_type or not conversation_id:
         return {}
-    return {
-        CHANNEL_RECIPIENT_META_KEY: {
-            "channel_type": channel_type,
-            "conversation_id": conversation_id,
-            "principal": str(principal or ""),
-        }
+    stamp: dict[str, Any] = {
+        "channel_type": channel_type,
+        "conversation_id": conversation_id,
+        "principal": str(principal or ""),
     }
+    if thread_id:
+        stamp["thread_id"] = str(thread_id)
+    return {CHANNEL_RECIPIENT_META_KEY: stamp}
 
 
 def channel_recipient_of(entry_meta: Any) -> tuple[str, str, str] | None:
@@ -1360,6 +1410,54 @@ def channel_recipient_of(entry_meta: Any) -> tuple[str, str, str] | None:
     if not channel_type or not conversation_id or not isinstance(principal, str):
         return None
     return channel_type, conversation_id, principal
+
+
+def channel_recipient_link(entry_meta: Any) -> ChannelLink | None:
+    """The conversation a stamped entry came from as a :class:`ChannelLink`, thread
+    included, or None for any other entry -- the same fail-closed reading as
+    :func:`channel_recipient_of`, spelled for :func:`mirror_room` and the notice."""
+    recipient = channel_recipient_of(entry_meta)
+    if recipient is None:
+        return None
+    channel_type, conversation_id, _principal = recipient
+    thread_id = entry_meta[CHANNEL_RECIPIENT_META_KEY].get("thread_id")
+    return ChannelLink(
+        channel_type,
+        channel_id=conversation_id,
+        thread_id=thread_id if isinstance(thread_id, str) and thread_id else None,
+    )
+
+
+def channel_recipient_released(now: dict[str, Any], entry_meta: Any) -> bool:
+    """Whether a stamped entry's conversation stopped resuming the session.
+
+    *now* is the drain-time ``containment_snapshot``. A channel resumes a
+    dashboard session through a mirror link (``set_mirror_link(...,
+    accepts_inbound=True)``), so from the slot's side the binding IS the entry's
+    own room among the session's mirror rooms: the room the stamp names
+    (:func:`mirror_room`) must still be one of the rooms the probe names now
+    (``now["mirror_identity"]``, read as :func:`mirror_audience`). Asked of THAT
+    room, not of whether any mirror survives: a session can hold two rooms
+    (:func:`_probe_channel_mirror` joins the mirror row and the Slack thread), and
+    the sender's room leaving while the other stays -- a Telegram conversation
+    ``/unlink``ed beside a Slack thread that remains -- keeps ``mirrored`` true
+    and reads to :func:`newly_held_constraints` as a narrowing, while for this
+    entry it is the reply route gone and the admission revoked. A mirror moved to
+    a DIFFERENT conversation drops here for the same reason (the origin room is
+    not among the rooms), beside the ``mirror_retarget`` the identity arm reports.
+    Only the probe-failure snapshot, which omits ``mirror_identity`` and fails
+    closed on ``mirrored`` through :func:`newly_held_constraints`, is read as the
+    boolean. Entries without the stamp -- composer text, peer sends, automation
+    -- are never affected: for them a mirror disappearing is not a lost reply
+    route.
+    """
+    link = channel_recipient_link(entry_meta)
+    if link is None:
+        return False
+    identity = now.get("mirror_identity")
+    if not isinstance(identity, str):
+        return not bool(now.get("mirrored"))
+    return mirror_room(link) not in mirror_audience(identity)
 
 
 def newly_held_constraints(
@@ -1574,6 +1672,17 @@ def notify_channel_recipient_dropped(
     consulted: this is a delivery receipt to the message's own author, not turn
     output, and the pause mutes output.
 
+    A linked Slack thread (the intercept's stamp) is the one address that ladder
+    answers None for by design -- Slack's dedicated client is not a registered
+    transport -- so it is posted through that client instead, after the same two
+    decisions the ladder takes: the channels-scope governance gate
+    (``chat_runner.channel_egress_permitted``, SEL-audited, fail-closed) and the
+    RECIPIENT re-decision from the stamped principal against Slack's LIVE roster
+    (``chat_runner._authorize_recipient`` over :class:`_LiveSlackRoster`), so a
+    sender revoked between admission and drop -- the stamp survives a restart
+    under the gateway's seal, and a roster edit is exactly what a restart applies
+    -- gets nothing, and the denial lands in the SEL trail as the ladder's do.
+
     Nothing of the ladder runs on the calling thread. The drain that drops the
     entry is synchronous on the event loop by contract (no suspension between its
     snapshot and the dequeue), so the send cannot be awaited there -- and the
@@ -1582,21 +1691,30 @@ def notify_channel_recipient_dropped(
     inside the scheduled task: the resolve through ``asyncio.to_thread``, the
     send awaited after it. The task is held in the state's background set so it
     cannot be collected mid-flight. Best-effort throughout: a failure is logged
-    and the drop, which is the authorization decision, stands.
+    and the drop, which is the authorization decision, stands -- with one
+    exception. A ``PlatformCompositionError`` means the governance ceiling itself
+    is invalid; the gate re-raises it rather than denying, and the task lets it
+    through so it lands in the log as a traceback rather than reading as a
+    routine skip.
 
     The quoted excerpt is redacted through the same egress chain every channel
     delivery uses: the author typed the text, but this is a network write and the
     conversation may be read on a shared screen.
     """
     recipient = channel_recipient_of(entry_meta)
-    if recipient is None:
+    link = channel_recipient_link(entry_meta)
+    if recipient is None or link is None:
         return False
-    channel_type, conversation_id, principal = recipient
+    channel_type, _conversation_id, principal = recipient
     # circular import: chat_runner imports this module's helpers at module level.
-    from kiro_crew.dashboard.chat_runner import _resolve_channel_target
+    from kiro_crew.dashboard.chat_runner import (
+        _resolve_channel_target,
+        channel_egress_permitted,
+    )
     from kiro_crew.dashboard.chat_utils import _redact_for_display
+    from kiro_crew.messaging.link import SLACK_NAMESPACE
+    from kiro_crew.platform.context import PlatformCompositionError
 
-    link = ChannelLink(channel_type, channel_id=conversation_id)
     session_key = slot_history_key(target_slot)
     excerpt = _redact_for_display(sanitize_outbound(send_drop_excerpt(text)))
     notice = (
@@ -1607,11 +1725,63 @@ def notify_channel_recipient_dropped(
         + (f' Text: "{excerpt}"' if excerpt else "")
     )
 
+    async def _send_slack() -> None:
+        slack_client = getattr(state, "slack_client", None)
+        if slack_client is None or not link.channel_id or not link.thread_id:
+            return
+        # The one egress the ladder cannot serve still asks the ladder's governance
+        # gate (SEL-audited, fail-closed): a session whose profile denies the
+        # channels scope for Slack is not posted into by the dedicated client either.
+        try:
+            permitted = await asyncio.to_thread(channel_egress_permitted, session_key, channel_type)
+        except PlatformCompositionError:
+            raise
+        except Exception:
+            logger.warning(
+                "channel drop notice: slack governance gate failed for %s; the drop is not "
+                "reported",
+                session_key,
+                exc_info=True,
+            )
+            return
+        if not permitted:
+            return
+        # Re-decide RECIPIENT authorization at egress, as the ladder leg does
+        # (``_resolve_channel_target`` -> ``_authorize_recipient``, one spelling):
+        # governance answered "may this session use Slack at all"; this answers
+        # whether the person the entry was admitted from is still allowed. Off the
+        # loop for the SEL row the denial writes, like the governance gate above.
+        try:
+            recipient_permitted = await asyncio.to_thread(
+                slack_recipient_still_allowed, link, principal, session_key=session_key
+            )
+        except Exception:
+            logger.warning(
+                "channel drop notice: slack recipient check failed for %s; the drop is not "
+                "reported",
+                session_key,
+                exc_info=True,
+            )
+            return
+        if not recipient_permitted:
+            return
+        try:
+            await slack_client.post_message(link.channel_id, notice, link.thread_id)
+        except Exception:
+            logger.warning("channel drop notice: send to slack failed", exc_info=True)
+
     async def _send() -> None:
+        if channel_type == SLACK_NAMESPACE:
+            await _send_slack()
+            return
         try:
             target = await asyncio.to_thread(
                 _resolve_channel_target, state, session_key, link, principal=principal
             )
+        except PlatformCompositionError:
+            # The ladder re-raises an invalid governance ceiling on purpose, and a
+            # best-effort notice is no place to swallow it.
+            raise
         except Exception:
             logger.warning(
                 "channel drop notice: send ladder failed for %s; the drop is not reported",
@@ -1639,7 +1809,68 @@ def notify_channel_recipient_dropped(
     if isinstance(background, set):
         background.add(task)
         task.add_done_callback(background.discard)
+    # The task swallows its own delivery failures; the one thing it lets through is
+    # a ``PlatformCompositionError``, which must land in the log as a traceback
+    # rather than die unretrieved with the task.
+    task.add_done_callback(_log_notice_task_exception)
     return True
+
+
+class _LiveSlackRoster:
+    """``may_send_to`` over Slack's LIVE owner roster, for ``_authorize_recipient``.
+
+    Slack is not a registered transport (its dedicated client posts), and the
+    ``SlackTransport`` adapter the inbound-spool replay builds carries a roster
+    SNAPSHOT taken for that pass. The drop notice re-decides from the roster as
+    it stands NOW, through the predicate the inbound gate admits with
+    (``slack.handler.is_allowed_user``), in ``may_send_to``'s own shape: a Slack
+    conversation id names no user, so the principal stamped at admission is the
+    only identity the gate can recheck, and an empty or revoked one fails closed.
+    """
+
+    def may_send_to(
+        self, conversation_id: str, thread_id: str | None = None, *, principal: str = ""
+    ) -> bool:
+        # Lazy, and the one Slack import in this module: the Slack package imports
+        # the dashboard, never the other way round at module level.
+        from kiro_crew.slack.handler import is_allowed_user
+
+        return bool(conversation_id and principal and is_allowed_user(principal))
+
+
+def slack_recipient_still_allowed(link: ChannelLink, principal: str, *, session_key: str) -> bool:
+    """Re-decide, at egress, whether the Slack principal a queued entry was admitted
+    from may still be posted to -- the ONE spelling for every proactive post the
+    dedicated Slack client makes on a stamped entry's behalf: the drop notice
+    (:func:`notify_channel_recipient_dropped`) and the channel-command refusal
+    notice (``chat_runner._run_chat``). Both reach a thread the entry's author
+    reads, after a queue wait during which the roster may have changed, so both
+    answer the question the ladder leg answers for every other channel
+    (``chat_runner._authorize_recipient`` over :class:`_LiveSlackRoster`), and the
+    denial lands in the SEL trail the same way. Synchronous -- the SEL row is a
+    file write -- so callers run it through ``asyncio.to_thread``. An empty
+    principal fails closed inside the roster, as does any raising check."""
+    # circular import: chat_runner imports this module's helpers at module level.
+    from kiro_crew.dashboard.chat_runner import _authorize_recipient
+    from kiro_crew.messaging.link import SLACK_NAMESPACE
+
+    return _authorize_recipient(
+        _LiveSlackRoster(),
+        SLACK_NAMESPACE,
+        link.channel_id or "",
+        link.thread_id,
+        principal=principal,
+        session_key=session_key,
+    )
+
+
+def _log_notice_task_exception(task: "asyncio.Task[Any]") -> None:
+    """Done callback for the drop-notice task: log an exception it let through."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("channel drop notice task failed", exc_info=exc)
 
 
 def audit_queued_drop(

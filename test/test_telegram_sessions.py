@@ -324,6 +324,30 @@ def _topic(text: str, thread: int) -> TelegramInboundMessage:
     )
 
 
+@contextmanager
+def _queue_mode(mode: str) -> Any:
+    """Put ``messaging.queue_mode = mode`` in force where the dispatcher reads it.
+
+    The busy path reads the mode per turn off the live config snapshot, not off the
+    ``cfg=`` copy the dispatcher was built with, so a test that varies it has to
+    publish the value there and take it back down afterwards.
+    """
+    import dataclasses
+
+    from kiro_crew.config import live
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    base = KiroCrewConfig()
+    live.reset_for_tests()
+    live.watch().prime(
+        dataclasses.replace(base, messaging=dataclasses.replace(base.messaging, queue_mode=mode))
+    )
+    try:
+        yield
+    finally:
+        live.reset_for_tests()
+
+
 def _callback(data: str, *, message_id: int = 101, label: str = "") -> Any:
     return SimpleNamespace(
         callback_query_id="q1",
@@ -1118,16 +1142,334 @@ class TestTelegramInboundResumeRouting:
         assert settlements == [1]
 
     @pytest.mark.asyncio
-    async def test_busy_resumed_session_refuses_without_queue_or_steer(self, tmp_path: Any) -> None:
+    async def test_busy_resumed_session_never_takes_this_chats_own_path(
+        self, tmp_path: Any
+    ) -> None:
+        """A follow-up sent while the resumed session is mid-turn goes to the
+        dashboard slot's own machinery. No slot can take it here (the live slot lookup
+        finds no dashboard state at all), so it is refused with the resumed-busy
+        wording -- and it is neither steered into the lease-holding turn nor queued
+        on this chat's queue, which drains only from the tail of a Telegram turn.
+        """
+        dispatcher, client, sessions, _ = _dispatcher(tmp_path)
+        dispatcher._session_resume.route = AsyncMock(
+            return_value=RoutingDecision(resumed_key="dashboard:chat-1")
+        )
+        sessions.busy = True
+        msg = _dm("and the weather?")
+        msg.message_id = 4242
+
+        await dispatcher.handle_message(msg)
+
+        assert sessions.provider.steered == []
+        assert sessions.queued == []
+        assert sessions.last_key == ""
+        assert any("busy with a turn started elsewhere" in text for text, _ in client.sent)
+        assert client.reactions == []
+
+    @pytest.mark.asyncio
+    async def test_a_false_enqueue_retry_stays_on_the_pinned_session(self, tmp_path: Any) -> None:
+        """Admitted natively; the steer await is a window in which the chat binds to
+        dashboard session B and the native turn ends, so the enqueue finds no turn and
+        the message is retried as a fresh turn. The retry must not route again -- that
+        is how it lands, and persists, in B -- it carries the pin it was admitted with
+        and runs there: a live message is never dropped by a rebind, only a replayed
+        entry is."""
+        dispatcher, client, sessions, _ = _dispatcher(tmp_path)
+        binding: list[str | None] = [None]
+        dispatcher._session_resume.route = AsyncMock(
+            side_effect=lambda *a, **kw: RoutingDecision(resumed_key=binding[0])
+        )
+        dispatcher._session_resume.resumed_session = lambda chat_id, thread: binding[0]  # type: ignore[method-assign]
+        sessions.busy = True
+
+        async def _steer(text: str) -> bool:
+            binding[0] = "dashboard:chat-B"  # `/sessions` landed mid-await
+            sessions.busy = False  # and the native turn ended, so the enqueue finds no turn
+            return False
+
+        sessions.provider.steer = _steer  # type: ignore[method-assign]
+
+        await dispatcher.handle_message(_dm("and the weather?"))
+
+        assert sessions.last_key != "dashboard:chat-B", "the retry re-routed into the new session"
+        assert sessions.last_key.startswith(
+            "telegram:"
+        ), "the retry did not run where it was pinned"
+        assert dispatcher._session_resume.route.await_count == 1, "the retry routed again"
+        assert not any("Dropped" in text for text, _ in client.sent), "a live message was dropped"
+
+    @pytest.mark.asyncio
+    async def test_busy_resumed_session_hands_off_to_a_running_dashboard_turn(
+        self, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        """When the DASHBOARD holds the resumed session's turn, the message goes to the
+        slot's own steer or queue path (``channel_handoff.hand_to_resumed_slot``) and
+        the channel's queue and steer are both left alone -- an entry in the channel's
+        queue would wait for a Telegram turn that may never come."""
+        from kiro_crew.dashboard import channel_handoff
+
+        dispatcher, client, sessions, _ = _dispatcher(tmp_path)
+        dispatcher._session_resume.route = AsyncMock(
+            return_value=RoutingDecision(resumed_key="dashboard:chat-1")
+        )
+        sessions.busy = True
+        handed: list[tuple[str, str, str, bool, dict[str, Any]]] = []
+
+        async def _hand(state, session_key, text, *, mode, has_attachments, **recipient):
+            handed.append((session_key, text, mode, has_attachments, recipient))
+            return channel_handoff.ResumedBusyOutcome(channel_handoff.HANDOFF_QUEUED)
+
+        monkeypatch.setattr(channel_handoff, "hand_to_resumed_slot", _hand)
+
+        await dispatcher.handle_message(_dm("and the weather?"))
+
+        # The chat rides along, so the drain can address a drop notice to it, with
+        # the user this dispatcher admitted.
+        assert handed == [
+            (
+                "dashboard:chat-1",
+                "and the weather?",
+                "steer",
+                False,
+                {
+                    "channel_type": "telegram",
+                    "conversation_id": "7",
+                    "principal": "7",
+                    "thread_id": "",
+                },
+            )
+        ]
+        assert sessions.provider.steered == []
+        assert sessions.queued == []
+        assert sessions.last_key == ""
+        assert any("Queued for that session" in text for text, _ in client.sent)
+
+    @pytest.mark.asyncio
+    async def test_a_privacy_marked_message_is_refused_at_the_hand_off_not_persisted(
+        self, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        """The live path refuses `/temporary <msg>` outright while a session is
+        resumed, so only a DRAINED entry can still carry one into the hand-off. The
+        hand-off queues into a PERSISTENT dashboard slot whose queue is written to
+        disk, which is exactly what the modifier asked to avoid -- so the message is
+        refused with the same words the live path uses, and nothing is queued or
+        persisted. Silence would announce privacy that does not hold; a receipt
+        would persist text the user marked private."""
+        from kiro_crew.dashboard import channel_handoff
+        from kiro_crew.messaging import privacy_mode
+
+        privacy_mode.reset()
+        dispatcher, client, sessions, _ = _dispatcher(tmp_path)
+        handed: list[str] = []
+
+        async def _hand(state, session_key, text, **k):
+            handed.append(text)
+            return channel_handoff.ResumedBusyOutcome(channel_handoff.HANDOFF_QUEUED)
+
+        monkeypatch.setattr(channel_handoff, "hand_to_resumed_slot", _hand)
+
+        await dispatcher._handle_resumed_busy(
+            "dashboard:chat-1",
+            _dm("summarise this"),
+            "summarise this",
+            None,
+            thread=None,
+            privacy_request=privacy_mode.MODE_TEMPORARY,
+            principal="7",
+        )
+
+        assert handed == [], "privacy-marked text was queued into a persistent slot"
+        assert privacy_mode.is_restricted("dashboard:chat-1") is False
+        assert any("NOT processed" in text for text, _ in client.sent)
+        assert not any("Queued behind the turn" in text for text, _ in client.sent)
+
+    @pytest.mark.asyncio
+    async def test_a_replayed_entry_still_carrying_a_privacy_modifier_gets_it_applied(
+        self, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        """A drain replays with commands off, so a `/incognito` still at the head of
+        a queued entry's text would neither mark the session nor be stripped: it
+        would stream to the model as prose and be persisted as such. The replay
+        parses the modifier off the text itself when the entry carried none as data,
+        applies it to the native session, and the turn is not persisted."""
+        from kiro_crew.messaging import privacy_mode
+
+        privacy_mode.reset()
+        dispatcher, client, sessions, _ = _dispatcher(tmp_path)
+        native_key = dispatcher._session_key(("direct", "7"))
+        entry = _origin()
+        sessions.queued.append(("1", "/incognito my secret plan", entry))
+        persisted: list[Any] = []
+        monkeypatch.setattr(dispatcher, "_persist_turn", lambda *a, **kw: persisted.append(a))
+
+        await dispatcher._drain_queue(native_key)
+
+        assert sessions.last_key == native_key
+        assert privacy_mode.is_restricted(native_key), "the modifier was not applied"
+        assert persisted == [], "privacy-marked text was persisted"
+        assert not any("/incognito" in text for text, _ in client.sent), "the modifier streamed raw"
+
+    @pytest.mark.asyncio
+    async def test_a_replayed_caption_on_an_attachment_is_content_not_a_privacy_modifier(
+        self, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        """The live intercept reads no command off a message that carries attachments
+        (``interpret_as_command = interpret_commands and not msg.attachments``): a
+        photo captioned ``/temporary look at this`` is content, so the caption
+        streams to the model with the photo and the session is not marked. The
+        replay's second reading of a queued entry's text is held to the same
+        condition -- the entry carries its attachments, so the caption is not
+        re-read as a modifier on the way out of the queue, not applied, not stripped,
+        and the turn persists as the ordinary turn it was live."""
+        from kiro_crew.messaging import privacy_mode
+        from kiro_crew.messaging.attachments import IngestResult
+        from kiro_crew.telegram import transport_dispatch
+
+        privacy_mode.reset()
+        dispatcher, client, sessions, _ = _dispatcher(tmp_path)
+        native_key = dispatcher._session_key(("direct", "7"))
+        photos = [{"file_id": "p1", "file_name": "a.jpg", "mime_type": "image/jpeg"}]
+        entry = _origin()
+        entry["attachments"] = photos
+        sessions.queued.append(("1", "/temporary look at this photo", entry))
+        persisted: list[Any] = []
+        monkeypatch.setattr(dispatcher, "_persist_turn", lambda *a, **kw: persisted.append(a))
+        ingested: list[list[Any]] = []
+
+        async def _ingest(client_: Any, raw: list[Any]) -> IngestResult:
+            ingested.append(list(raw))
+            return IngestResult()
+
+        monkeypatch.setattr(transport_dispatch, "process_telegram_attachments", _ingest)
+
+        await dispatcher._drain_queue(native_key)
+
+        assert sessions.last_key == native_key, "the captioned photo did not run as a turn"
+        assert ingested == [photos], "the replayed attachments were not ingested"
+        assert not privacy_mode.is_restricted(
+            native_key
+        ), "a caption on an attachment was re-read as a privacy modifier on replay"
+        built = [call["text"] for call in dispatcher.ctx_builder.build_calls]
+        assert built and built[-1].startswith(
+            "/temporary look at this photo"
+        ), f"the caption was stripped instead of reaching the model verbatim: {built!r}"
+        assert persisted, "an ordinary captioned turn was not persisted"
+
+    @pytest.mark.asyncio
+    async def test_attachments_are_refused_while_the_dashboard_drives(
+        self, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        from kiro_crew.dashboard import channel_handoff
+
         dispatcher, client, sessions, _ = _dispatcher(tmp_path)
         dispatcher._session_resume.route = AsyncMock(
             return_value=RoutingDecision(resumed_key="dashboard:chat-1")
         )
         sessions.busy = True
 
-        await dispatcher.handle_message(_dm("continue"))
+        async def _hand(*a, **k):
+            return channel_handoff._refused(channel_handoff.REFUSED_ATTACHMENTS)
 
-        assert any("busy" in text.lower() for text, _ in client.sent)
+        monkeypatch.setattr(channel_handoff, "hand_to_resumed_slot", _hand)
+        msg = _dm("see attached")
+        msg.attachments = [SimpleNamespace(name="photo.jpg")]
+
+        await dispatcher.handle_message(msg)
+
+        assert sessions.provider.steered == []
+        assert sessions.queued == []
+        assert any("attachments" in text for text, _ in client.sent)
+
+    @pytest.mark.asyncio
+    async def test_a_full_dashboard_queue_is_refused_while_the_dashboard_drives(
+        self, tmp_path: Any, monkeypatch: Any
+    ) -> None:
+        """The hand-off's cap outcome reaches the sender as a refusal; nothing is
+        steered or queued on the channel side either."""
+        from kiro_crew.dashboard import channel_handoff
+
+        dispatcher, client, sessions, _ = _dispatcher(tmp_path)
+        dispatcher._session_resume.route = AsyncMock(
+            return_value=RoutingDecision(resumed_key="dashboard:chat-1")
+        )
+        sessions.busy = True
+
+        async def _hand(*a, **k):
+            return channel_handoff._refused(channel_handoff.REFUSED_QUEUE_FULL)
+
+        monkeypatch.setattr(channel_handoff, "hand_to_resumed_slot", _hand)
+
+        await dispatcher.handle_message(_dm("one too many"))
+
+        assert sessions.provider.steered == []
+        assert sessions.queued == []
+        assert any("queue is full" in text for text, _ in client.sent)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("queue_mode", ["steer", "queue"])
+    async def test_session_switch_typed_while_the_resumed_turn_is_busy_is_executed(
+        self, tmp_path: Any, queue_mode: str
+    ) -> None:
+        """The scenario: the agent is busy in a resumed session, the user types
+        ``/session <other> issue``. The gateway runs the command -- the picker opens
+        for the query "<other> issue", per the command's own grammar -- and nothing
+        lands in the busy turn as a queue entry or a steer, in either queue mode."""
+        dispatcher, client, sessions, _ = _dispatcher(tmp_path)
+        dispatcher._session_resume.route = AsyncMock(
+            return_value=RoutingDecision(resumed_key="dashboard:chat-1")
+        )
+        dispatcher._session_resume.show_picker = AsyncMock()
+        sessions.busy = True
+
+        with _queue_mode(queue_mode):
+            await dispatcher.handle_message(_dm("/session other issue"))
+
+        dispatcher._session_resume.show_picker.assert_awaited_once()
+        assert dispatcher._session_resume.show_picker.await_args.kwargs["query"] == "other issue"
+        assert sessions.queued == []
+        assert sessions.provider.steered == []
+        assert sessions.last_key == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("queue_mode", ["steer", "queue"])
+    @pytest.mark.parametrize("command", ["/new", "/stop", "/unlink", "/help"])
+    async def test_commands_typed_while_the_resumed_turn_is_busy_are_never_queued_or_steered(
+        self, tmp_path: Any, queue_mode: str, command: str
+    ) -> None:
+        """Every gateway command outranks the busy path: it executes, and the busy
+        turn never sees its text."""
+        dispatcher, client, sessions, _ = _dispatcher(tmp_path)
+        dispatcher._session_resume.route = AsyncMock(
+            return_value=RoutingDecision(resumed_key="dashboard:chat-1")
+        )
+        dispatcher._session_resume.leave_resumed_session = AsyncMock(
+            return_value="dashboard:chat-1"
+        )
+        sessions.busy = True
+
+        with _queue_mode(queue_mode):
+            await dispatcher.handle_message(_dm(command))
+
+        assert sessions.queued == []
+        assert sessions.provider.steered == []
+        assert sessions.last_key == ""
+        assert client.sent, command
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("queue_mode", ["steer", "queue"])
+    async def test_commands_typed_while_the_native_turn_is_busy_are_never_queued_or_steered(
+        self, tmp_path: Any, queue_mode: str
+    ) -> None:
+        dispatcher, client, sessions, _ = _dispatcher(tmp_path)
+        dispatcher._session_resume.show_picker = AsyncMock()
+        sessions.busy = True
+
+        with _queue_mode(queue_mode):
+            await dispatcher.handle_message(_dm("/session other issue"))
+            await dispatcher.handle_message(_dm("/help"))
+
+        dispatcher._session_resume.show_picker.assert_awaited_once()
         assert sessions.queued == []
         assert sessions.provider.steered == []
         assert sessions.last_key == ""
@@ -1255,6 +1597,8 @@ class TestTelegramColdResume:
         dispatcher._session_resume.route = AsyncMock(
             return_value=RoutingDecision(resumed_key="dashboard:chat-1")
         )
+        # The store agrees with the mocked decision: the closing gate re-reads it.
+        dispatcher._session_resume.resumed_session = lambda chat_id, thread: "dashboard:chat-1"  # type: ignore[method-assign]
         captured: list[str | None] = []
         real_persist = dispatcher._persist_turn
 
@@ -1276,6 +1620,8 @@ class TestTelegramColdResume:
         dispatcher._session_resume.route = AsyncMock(
             return_value=RoutingDecision(resumed_key="dashboard:chat-1")
         )
+        # The store agrees with the mocked decision: the closing gate re-reads it.
+        dispatcher._session_resume.resumed_session = lambda chat_id, thread: "dashboard:chat-1"  # type: ignore[method-assign]
         loop_thread = threading.get_ident()
         reads: list[int] = []
         real_get = log.get_metadata
@@ -1296,6 +1642,8 @@ class TestTelegramColdResume:
         dispatcher._session_resume.route = AsyncMock(
             return_value=RoutingDecision(resumed_key="dashboard:chat-1")
         )
+        # The store agrees with the mocked decision: the closing gate re-reads it.
+        dispatcher._session_resume.resumed_session = lambda chat_id, thread: "dashboard:chat-1"  # type: ignore[method-assign]
 
         def _broken(key: str) -> dict[str, Any]:
             raise OSError("unreadable")
@@ -1317,6 +1665,8 @@ class TestTelegramColdResume:
         dispatcher._session_resume.route = AsyncMock(
             return_value=RoutingDecision(resumed_key="dashboard:chat-1")
         )
+        # The store agrees with the mocked decision: the closing gate re-reads it.
+        dispatcher._session_resume.resumed_session = lambda chat_id, thread: "dashboard:chat-1"  # type: ignore[method-assign]
         surface = AsyncMock()
         monkeypatch.setattr(channel_slots, "surface_dispatcher_session", surface)
         title_claims: list[str] = []
@@ -1341,6 +1691,8 @@ class TestTelegramColdResume:
         dispatcher._session_resume.route = AsyncMock(
             return_value=RoutingDecision(resumed_key="dashboard:chat-1")
         )
+        # The store agrees with the mocked decision: the closing gate re-reads it.
+        dispatcher._session_resume.resumed_session = lambda chat_id, thread: "dashboard:chat-1"  # type: ignore[method-assign]
         broadcasts: list[bool] = []
 
         def _project(*_args: Any, **kwargs: Any) -> None:

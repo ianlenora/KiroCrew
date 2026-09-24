@@ -169,7 +169,7 @@ from kiro_crew.dashboard.slot_buffers import (
     persist_deferred_notes_sync,
 )
 from kiro_crew.dashboard.slot_projection import resolved_row_identity, stop_declined_armed
-from kiro_crew.dashboard.slot_queue_repository import warn_if_not_durable
+from kiro_crew.dashboard.slot_queue_repository import seal_key_of, warn_if_not_durable
 from kiro_crew.dashboard.state import (
     _MAX_DISMISSED_SOURCE_LINKS,
     DashboardState,
@@ -1030,7 +1030,10 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
             directive_user_origin=not bool(request_app),
         )
         _redacted = queued_text_for_display(message, user_origin=not bool(request_app))
-        warn_if_not_durable(slot._queue, qid, slot.key)
+        _proofs = getattr(slot, "_origin_proofs", None)
+        _generation = getattr(slot, "_queue_generation", "")
+        # Under the seal key, as the busy-slot path costs it (``chat_delivery``).
+        warn_if_not_durable(slot._queue, qid, seal_key_of(slot), _proofs, _generation)
         # Start the durable write here too, not only in the busy-slot branch.
         # This branch holds an IDLE slot, so no drain is coming to write the
         # prompt's transcript row and no turn-end flush is scheduled: the queue

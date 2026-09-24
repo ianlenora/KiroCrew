@@ -321,7 +321,17 @@ class TestLeafOnlyPopulationIsRecorded:
     #: launch fingerprints; ``mcp/resolved`` holds executables substituted for an
     #: approved launch. Each sits beside writable siblings, so no parent stand-in
     #: can hold it.
-    EXPECTED: dict[str, int] = {"standard": 262, "cc": 269, "strict": 270}
+    #:
+    #: One more landed with the queued-prompt provenance seal, at the root for
+    #: the same reason (``sandbox._CREW_HIDDEN_LEAVES`` states it beside the
+    #: entry): no masked directory holds per-slot gateway state, and a leaf
+    #: under an agent-writable ancestor could be renamed out from under its mask:
+    #:
+    #: * ``queue-generations`` -- the committed queue generation per slot
+    #:   (``dashboard/queue_generation_store.py``), which the restore requires a
+    #:   session's queued-prompt line to name before it honours the line's seals;
+    #:   written by the gateway's save and read by its restore prefetch only.
+    EXPECTED: dict[str, int] = {"standard": 265, "cc": 272, "strict": 273}
 
     @pytest.mark.parametrize("tier", TIERS)
     def test_leaf_only_count_has_not_grown(self, tier: str) -> None:

@@ -413,6 +413,42 @@ class TestCommands:
         d._session_restricted.assert_awaited()
 
     @pytest.mark.asyncio
+    async def test_a_live_turn_on_a_resumed_conversation_is_not_dropped_by_a_rebind(
+        self,
+    ) -> None:
+        """The closing gate drops REPLAYED queue entries whose pinned binding moved,
+        never a live message: the user typed it against the binding it was pinned
+        to, and a rebind landing during its setup awaits must not turn a message
+        nobody queued into a "dropped queued message" notice. It runs where pinned."""
+        provider = FakeProvider(
+            [AcpEvent(kind=EVENT_TEXT_CHUNK, text="hi there"), AcpEvent(kind=EVENT_COMPLETE)]
+        )
+        sessions = FakeSessions(provider)
+        client = FakeClient()
+        conv = FakeConvLog()
+        d = _dispatcher(sessions, FakeCtx(), client, conv_log=conv)
+        binding = ["dashboard:chat-A"]
+        d._session_resume.route = AsyncMock(
+            side_effect=lambda conversation_id: RoutingDecision(resumed_key=binding[0])
+        )
+        d._session_resume.resumed_session = lambda conversation_id: binding[0]  # type: ignore[method-assign]
+        real_get = sessions.get_or_create
+
+        async def _get(key, **kw):
+            result = await real_get(key, **kw)
+            binding[0] = "dashboard:chat-B"  # rebind during a setup await
+            return result
+
+        sessions.get_or_create = _get  # type: ignore[method-assign]
+
+        await d.handle_message(_inbound("continue"))
+
+        assert sessions.begin_turns == 1, "a live turn was refused at the closing gate"
+        assert sessions.successes == ["dashboard:chat-A"]
+        assert ("dashboard:chat-A", "user", "continue") in conv.appended
+        assert not any("Dropped" in content for (_, content, _) in client.sent)
+
+    @pytest.mark.asyncio
     async def test_new_bumps_gen_and_acks(self) -> None:
         sessions = FakeSessions(FakeProvider([]))
         client = FakeClient()

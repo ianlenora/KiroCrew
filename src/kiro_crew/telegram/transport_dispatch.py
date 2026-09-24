@@ -107,6 +107,7 @@ from kiro_crew.messaging.renderer import (
     session_provenance_tag,
 )
 from kiro_crew.messaging.session_resume import (
+    ResumeBinding,
     ResumeReleaseError,
     RoutingDecision,
     persisted_session_agent,
@@ -201,6 +202,77 @@ _UNTAGGED_OPTIONS_REFUSAL = (
 _BUSY_OPTIONS_REFUSAL = (
     "🔘 That conversation is busy with another turn, so your choice was NOT "
     "applied. Type it as a message once the turn finishes."
+)
+
+#: What a typed message into a BUSY resumed dashboard session is told. The
+#: dashboard slot's own mid-turn machinery took it (``dashboard/channel_handoff.py``)
+#: -- a dashboard-driven turn's reply reaches this chat, if at all, through the
+#: dashboard's own cross-surface leg and never through this dispatcher, so without
+#: a confirmation the hand-off is indistinguishable from a drop.
+#: A `/temporary` or `/incognito` modifier reached a RESUMED dashboard session. The
+#: modifier cannot be applied: a dashboard slot owns its memory mode, and marking
+#: only Telegram's process-local tracker would announce privacy while the
+#: persistent slot kept recording. Nor may the text be queued into that slot, whose
+#: queue is written to disk -- persisting text the user marked private is the one
+#: outcome the modifier exists to prevent. So the message is refused, and said so:
+#: by the intercept on the live path, and by the hand-off should one ever reach it.
+_RESUMED_PRIVACY_REFUSAL = (
+    "🔒 Privacy mode can't be changed while a dashboard session is "
+    "resumed. Your message was NOT processed. Use /unlink or /new first."
+)
+
+_RESUMED_STEERED = "↪️ Steering that session — your message was folded into its running turn."
+_RESUMED_QUEUED = "⏳ Queued for that session — it runs when the current turn finishes."
+#: The session closed while the message was in flight; the close archives the
+#: queue the turn's teardown moved the text onto, so it runs on the next resume.
+_RESUMED_QUEUED_AFTER_CLOSE = (
+    "⏳ Queued for that session — it closed while your message was in flight; "
+    "the message runs when the session is next resumed."
+)
+#: The session changed while the message was in flight and the successor ran it.
+_RESUMED_RAN_AFTER_MOVE = (
+    "✅ Delivered to that session — it was reopened while your message was in flight, "
+    "and the message ran there as its own turn."
+)
+#: The session closed while the message was in flight and the queue the close
+#: archived does not (yet) carry the text: it is held only in memory, which
+#: nothing revisits once the slot is popped. Honest at the instant: the message
+#: may still run if the archive catches up, so the remedy is to watch first.
+_RESUMED_BUSY_UNSAVED_CLOSE_REFUSAL = (
+    "⏳ That session closed while your message was in flight, and the message had "
+    "not been saved with it yet. If it does not run once the session is reopened, "
+    "send it again."
+)
+#: The slot's live queue is at its bound. Refused rather than appended past it or
+#: evicting a waiting entry; the author still holds the text.
+_RESUMED_BUSY_QUEUE_FULL_REFUSAL = (
+    "⏳ That session's queue is full, so this message was NOT added. "
+    "Send it again once some of the waiting messages have run."
+)
+#: The slot cannot take the message: no open tab, a closing or remote-bound
+#: slot, or a lease held by something other than the dashboard turn loop
+#: (Telegram's own turn on the resumed key). An incognito or temporary session is
+#: taken like any other: those modes keep their transcript and queue.
+_RESUMED_BUSY_REFUSAL = (
+    "⏳ That session is busy with a turn started elsewhere. Send your "
+    "message again once it finishes, or /unlink to return to your "
+    "Telegram conversation."
+)
+#: Attachments cannot ride either arm: ``_session/steer`` carries text only, and
+#: the slot's queue cannot carry Telegram attachment material (downloaded by the
+#: Telegram turn that runs the message, which the dashboard drain has no hook to
+#: own). The files stay with the user rather than being dropped or answered without.
+_RESUMED_BUSY_ATTACHMENTS_REFUSAL = (
+    "⏳ That session is busy, and a message with attachments cannot wait in its "
+    "queue. Send it again once the turn finishes."
+)
+#: The slot the steer was handed to stopped being the one the session resolves
+#: to while the RPC was suspended (closed, or closed and recreated under the same
+#: key). Nothing would drain a queue entry made now, so the text is refused with
+#: the remedy rather than confirmed and lost.
+_RESUMED_BUSY_MOVED_REFUSAL = (
+    "⏳ That session changed while your message was in flight, so it was NOT "
+    "delivered. Send it again."
 )
 
 _RELEASE_FAILURE = (
@@ -736,6 +808,7 @@ class TelegramDispatcher:
         interpret_commands: bool = True,
         privacy_request: str = "",
         origin_tag: str = "",
+        binding: ResumeBinding | None = None,
     ) -> None:
         """Drive one authorized inbound message through TurnDriver end-to-end.
 
@@ -749,6 +822,18 @@ class TelegramDispatcher:
         button. A non-empty tag makes that button valid only while the current
         and final post-rotation session keys still match it. The choice is never
         queued or steered, because those paths retain text but not provenance.
+
+        *binding* is a :class:`ResumeBinding` already pinned for this message, and
+        supplying one turns routing OFF: the message runs where the pin says --
+        natively for a drained entry (the only affinity this channel's queue holds;
+        a message into a busy RESUMED session goes to the dashboard slot's own
+        machinery instead), or the session a live message was admitted for. The
+        drain supplies one because it re-enters with commands off, which also skips
+        resume routing, and the pin says so explicitly. The busy path's retry after
+        a false enqueue supplies one too: re-routing that retry is how a rebind
+        landing during the awaited steer would carry the message into another
+        session. A fresh message pins its own binding from the routing decision, and
+        that pin is what every later step takes.
         """
         assert self.client is not None, "TelegramDispatcher.client must be set"
         user_id = int(msg.user_id)
@@ -850,6 +935,27 @@ class TelegramDispatcher:
             if interpret_as_command and override_mode is None
             else None
         )
+        if (
+            binding is not None
+            and binding.is_replay
+            and not privacy_request
+            # Same condition as the live intercept above: a caption on an attachment
+            # is content, so a photo captioned ``/temporary ...`` is not re-read as a
+            # modifier on replay any more than it was read as one live.
+            and not msg.attachments
+        ):
+            # A drained entry runs with commands off, so a modifier still at the head
+            # of its text would neither mark the session nor be stripped -- it would
+            # stream to the model and be persisted as ordinary prose. The producer
+            # strips it at enqueue and carries it as data (``privacy_request``), so
+            # this is a second reading of the same text, taken only when the entry
+            # carried none: an entry that was queued any other way still gets the
+            # privacy it asked for. Only a replay: a chip label is model-authored
+            # text and must reach the model verbatim.
+            replayed_cmd = parse_command(text, self.bot_username)
+            if replayed_cmd in (privacy_mode.MODE_TEMPORARY, privacy_mode.MODE_INCOGNITO):
+                privacy_request = replayed_cmd
+                text = parse_command_argument(text)
         decision = RoutingDecision()
         # A HOST-scoped listing is not conversation work: `/spawn list` and
         # `/task status` report on the whole box, so routing them through a resumed
@@ -857,8 +963,12 @@ class TelegramDispatcher:
         # with that session. Asked of the argument, not the command name, because
         # the same verb is conversation-scoped with a different argument.
         lists_host = cmd is not None and lists_host_state(cmd, parse_command_argument(text))
+        # A message that arrives already pinned (a drain replay, the busy path's
+        # retry) is never routed again: routing is how a rebind that landed while
+        # it waited would carry it into another session. Its pin is validated below.
         wants_routing = (
-            (interpret_commands or bool(origin_tag))
+            binding is None
+            and (interpret_commands or bool(origin_tag))
             and (cmd not in _DETACH_EXEMPT_COMMANDS)
             and not lists_host
         )
@@ -879,7 +989,12 @@ class TelegramDispatcher:
                     ):
                         await self._session_resume.settle(chat_id, reply_thread, decision)
                     return
-        resumed_key = decision.resumed_key
+        # The pin is taken HERE, once, and is what every later step takes: the
+        # busy path and its retry, the queue entry. None of them re-resolves the
+        # binding.
+        if binding is None:
+            binding = ResumeBinding.from_route(decision)
+        resumed_key = binding.resumed_key
 
         if cmd == "new":
             try:
@@ -952,12 +1067,7 @@ class TelegramDispatcher:
                 # not a dashboard capability, so fail visibly instead of inventing
                 # a second authority. This covers both a bare modifier and
                 # `/temporary <message>`: the message is NOT processed.
-                await self._reply(
-                    chat_id,
-                    "🔒 Privacy mode can't be changed while a dashboard session is "
-                    "resumed. Your message was NOT processed. Use /unlink or /new first.",
-                    thread=reply_thread,
-                )
+                await self._reply(chat_id, _RESUMED_PRIVACY_REFUSAL, thread=reply_thread)
                 return
             rest = parse_command_argument(text)
             if not rest:
@@ -1081,7 +1191,10 @@ class TelegramDispatcher:
             )
             return
 
-        session_key = resumed_key or self._session_key(route)
+        # Resolve the pin's session once: the resumed key, or this chat's own current
+        # key. Every helper below reads ``binding.session_key`` and derives none.
+        binding = binding.at(self._session_key(route))
+        session_key = binding.session_key
         if origin_tag and session_provenance_tag(session_key) != origin_tag:
             await self._reply(chat_id, _STALE_OPTIONS_REFUSAL, thread=reply_thread)
             return
@@ -1090,16 +1203,26 @@ class TelegramDispatcher:
                 await self._reply(chat_id, _BUSY_OPTIONS_REFUSAL, thread=reply_thread)
                 return
             if resumed_key is not None:
-                await self._reply(
-                    chat_id,
-                    "⏳ That session is busy with a turn started elsewhere. Send your "
-                    "message again once it finishes, or /unlink to return to your "
-                    "Telegram conversation.",
+                # NOT `_handle_busy`: that queues into THIS dispatcher's queue, which
+                # is drained only at the tail of a TELEGRAM-driven turn and replayed
+                # with resume routing off -- so a message queued there while the
+                # dashboard drives would sit until some later Telegram turn and then
+                # run in the NATIVE session. The dashboard slot has its own steer path
+                # and its own queue, drained by the dashboard turn loop; the message
+                # goes to those, and the refusal stays for the cases the slot cannot
+                # take (see the Discord dispatcher's resumed-busy path).
+                await self._handle_resumed_busy(
+                    session_key,
+                    msg,
+                    text,
+                    override_mode,
                     thread=reply_thread,
+                    privacy_request=privacy_request,
+                    principal=str(user_id),
                 )
                 return
             await self._handle_busy(
-                session_key,
+                binding,
                 msg,
                 text,
                 override_mode,
@@ -1109,8 +1232,11 @@ class TelegramDispatcher:
             )
             return
 
-        if resumed_key is None:
-            session_key = self._rotated_session_key(route)
+        if not binding.pinned:
+            # Rotation settles here for a native turn; the pin resolves against the
+            # rotated key. Still the same pin, never a second look at the binding.
+            binding = binding.at(self._rotated_session_key(route))
+            session_key = binding.session_key
         if origin_tag and session_provenance_tag(session_key) != origin_tag:
             await self._reply(chat_id, _STALE_OPTIONS_REFUSAL, thread=reply_thread)
             return
@@ -1702,9 +1828,112 @@ class TelegramDispatcher:
             if not deciders:
                 self._routing_locks.pop(route_id, None)
 
-    async def _handle_busy(
+    async def _handle_resumed_busy(
         self,
         session_key: str,
+        msg: InboundMessage,
+        text: str,
+        override_mode: str | None,
+        *,
+        thread: int | None,
+        privacy_request: str = "",
+        principal: str = "",
+    ) -> None:
+        """A message arrived while the RESUMED dashboard session is mid-turn.
+
+        The same mode ladder as :meth:`_handle_busy` -- the per-message override,
+        else ``messaging.queue_mode`` -- but the destination is the dashboard slot's
+        own machinery (``dashboard.channel_handoff.hand_to_resumed_slot``), never this
+        dispatcher's queue: that queue is drained at the tail of a TELEGRAM-driven
+        turn and replayed with resume routing off, so an entry made while the
+        dashboard drives would run later in the native session. The slot's queue is
+        drained by the dashboard turn loop, so its ordering is the dashboard's.
+
+        Every outcome is confirmed in the chat. A dashboard-driven turn's reply
+        reaches this conversation, if at all, through the dashboard's own
+        cross-surface leg and never through this dispatcher, so a silent hand-off
+        would read as a drop and the user would resend into the same turn.
+
+        *privacy_request* is a ``/temporary`` or ``/incognito`` modifier. The live
+        path refuses one outright while a dashboard session is resumed (see the
+        intercept above), so none is expected here; the guard keeps the invariant
+        fail-closed should a caller ever carry one in. It cannot be applied -- a
+        dashboard slot owns its ``memory_mode`` -- and the text cannot be queued
+        either: the slot's queue is written to disk, and persisting text the user
+        marked private is the one outcome the modifier exists to prevent. The message
+        is refused with the live path's own words, before the hand-off can enqueue
+        anything, and nothing reaches the slot.
+
+        *principal* is the Telegram user this dispatcher admitted the message from;
+        it rides the entry's recipient stamp so a drop notice can be authorized
+        against the user roster.
+        """
+        chat_id = int(msg.conversation_id)
+        if privacy_request:
+            # Decided BEFORE the shared helper can enqueue: the refusal must leave
+            # no durable copy of the text behind it.
+            await self._reply(chat_id, _RESUMED_PRIVACY_REFUSAL, thread=thread)
+            return
+        # Deferred, like every dashboard import in this module: the dispatcher is on
+        # the gateway boot path and the dashboard package is not.
+        from kiro_crew.dashboard.channel_handoff import (
+            HANDOFF_STEERED,
+            QUEUED_BY_CLOSE,
+            RAN_ON_SUCCESSOR,
+            REFUSED_ATTACHMENTS,
+            REFUSED_MOVED,
+            REFUSED_QUEUE_FULL,
+            REFUSED_UNSAVED_CLOSE,
+            hand_to_resumed_slot,
+        )
+
+        link = self._session_resume.link_for(chat_id, thread)
+        mode = override_mode or str(self._live_cfg().messaging.queue_mode)
+        outcome = await hand_to_resumed_slot(
+            getattr(self._session_resume, "dashboard_state", None),
+            session_key,
+            text,
+            mode=mode,
+            has_attachments=bool(msg.attachments),
+            # Where a drop notice goes if the drain later refuses a queued entry,
+            # and the principal the outbound recipient check needs: this user was
+            # authorized against the allow-list on inbound, and a dashboard slot's
+            # session key names no Telegram peer of its own. The topic thread, when
+            # there is one, is part of the room's identity.
+            channel_type=link.channel_type,
+            conversation_id=link.channel_id or "",
+            principal=principal,
+            thread_id=str(link.thread_id or ""),
+        )
+        if outcome.refused:
+            logger.info(
+                "telegram: message into busy resumed session %s refused (%s)",
+                session_key,
+                outcome.reason,
+            )
+            if outcome.reason == REFUSED_ATTACHMENTS:
+                reply = _RESUMED_BUSY_ATTACHMENTS_REFUSAL
+            elif outcome.reason == REFUSED_MOVED:
+                reply = _RESUMED_BUSY_MOVED_REFUSAL
+            elif outcome.reason == REFUSED_QUEUE_FULL:
+                reply = _RESUMED_BUSY_QUEUE_FULL_REFUSAL
+            elif outcome.reason == REFUSED_UNSAVED_CLOSE:
+                reply = _RESUMED_BUSY_UNSAVED_CLOSE_REFUSAL
+            else:
+                reply = _RESUMED_BUSY_REFUSAL
+        elif outcome.kind == HANDOFF_STEERED:
+            reply = _RESUMED_STEERED
+        elif outcome.reason == QUEUED_BY_CLOSE:
+            reply = _RESUMED_QUEUED_AFTER_CLOSE
+        elif outcome.reason == RAN_ON_SUCCESSOR:
+            reply = _RESUMED_RAN_AFTER_MOVE
+        else:
+            reply = _RESUMED_QUEUED
+        await self._reply(chat_id, reply, thread=thread)
+
+    async def _handle_busy(
+        self,
+        binding: ResumeBinding,
         msg: InboundMessage,
         text: str,
         override_mode: str | None,
@@ -1717,6 +1946,13 @@ class TelegramDispatcher:
         it. ``text`` is the message with any ``/queue``|``/steer`` directive
         stripped; ``override_mode`` ('queue' | 'steer' | None) forces the path for
         THIS message, overriding the global ``queue_mode``.
+
+        *binding* is the pin the message was admitted with: it names the session
+        whose turn is running (this chat's own -- a resumed session's busy turn is
+        handed to the dashboard slot instead, see ``_handle_resumed_busy``), and
+        the retry after a false enqueue re-enters with it -- routing again there is
+        how a rebind landing during the awaited steer would carry the message into
+        another session (see ``handle_message``'s ``binding``).
 
         *privacy_request* is a modifier the caller stripped off *text*, and the two
         branches owe it different things because they run the request under different
@@ -1732,6 +1968,8 @@ class TelegramDispatcher:
         """
         assert self.client is not None
         chat_id = int(msg.conversation_id)
+        session_key = binding.session_key
+        assert session_key, "the pin is resolved at admission (ResumeBinding.at)"
         mode = override_mode or str(self._live_cfg().messaging.queue_mode)
         # An attachment-bearing message can never take the steer path: ``steer``
         # forwards TEXT ONLY, so steering a photo/document message would deliver
@@ -1859,7 +2097,7 @@ class TelegramDispatcher:
         # we run it now (re-entering handle_message, which re-strips the directive
         # and runs it as a fresh turn) instead of stranding it.
         if not await self._enqueue_with_receipt(
-            session_key,
+            binding,
             chat_id,
             text,
             thread=thread,
@@ -1878,8 +2116,11 @@ class TelegramDispatcher:
         ):
             # Not queued, so re-run it now. The ORIGINAL msg, whose text still
             # carries the modifier, so command parsing re-derives the request rather
-            # than this path having to re-thread it.
-            await self.handle_message(msg)
+            # than this path having to re-thread it -- on the pin it was admitted
+            # with. Re-entering unpinned would route it again, and a rebind that
+            # landed during the awaited steer would then run and persist it in a
+            # session this message was never admitted for.
+            await self.handle_message(msg, binding=binding)
 
     async def _drain_queue(self, session_key: str) -> None:
         """Collapse every message ONE SENDER queued during the just-finished turn
@@ -2088,6 +2329,9 @@ class TelegramDispatcher:
                 # scoped to ONE sender's messages, so one person's modifier can no
                 # longer restrict a turn answering someone else.
                 privacy_request=privacy_mode.strictest(privacy_requests),
+                # Pinned native, like every entry this queue holds: commands off
+                # also means routing off, and the pin says so explicitly.
+                binding=ResumeBinding.for_replay(),
             )
 
     # ── Mid-turn queue receipt (single, in-place, persistent record) ───────
@@ -2123,7 +2367,7 @@ class TelegramDispatcher:
 
     async def _enqueue_with_receipt(
         self,
-        session_key: str,
+        binding: ResumeBinding,
         chat_id: int,
         text: str,
         *,
@@ -2148,8 +2392,13 @@ class TelegramDispatcher:
         a way to enqueue an unattributed message, which under
         ``dm_scope = "unified"`` the drain could only answer under someone else's
         identity.
+
+        *binding* is the pin the message was admitted with: the queue it joins is
+        that session's.
         """
         assert self.client is not None
+        session_key = binding.session_key
+        assert session_key, "the pin is resolved at admission (ResumeBinding.at)"
         async with self._queue.lock:
             if not self.sessions.enqueue(
                 session_key,

@@ -118,6 +118,7 @@ from kiro_crew.messaging.queue_drain import (
 )
 from kiro_crew.messaging.renderer import DONE, OutputEvent, Renderer, SilentRenderer
 from kiro_crew.messaging.session_resume import (
+    ResumeBinding,
     persisted_session_agent,
     refused_resume_is_restricted,
 )
@@ -576,6 +577,7 @@ class DiscordDispatcher:
         origin_tag: str = "",
         monitor_completion: MonitorCompletionHook | None = None,
         monitor_session_key: str | None = None,
+        binding: ResumeBinding | None = None,
     ) -> MonitorDispatchResult | None:
         """Drive one authorized inbound message through TurnDriver end-to-end.
 
@@ -595,6 +597,18 @@ class DiscordDispatcher:
         non-empty tag: the buttons were rendered on the bound session's own
         reply, so the choice belongs to that session even though its label must
         not execute as a command.
+
+        ``binding`` is a :class:`ResumeBinding` already pinned for this message,
+        and supplying one turns routing OFF: the message runs where the pin says
+        -- natively, or the resumed session the pin names -- provided this chat
+        still resumes that key. Two callers supply one: the queue drain (its
+        entries pin native, the only affinity this queue holds) and the busy
+        path's retry after a false enqueue (the turn ended while the steer or the
+        queue lock was awaited, and re-routing the retry is how a rebind in that
+        window would land it in another session). An entry whose binding was
+        released or moved is dropped with a notice rather than answered into a
+        session the user left. A fresh message pins its own binding from the
+        routing decision, and that pin is what every later step takes.
 
         ``origin_tag`` is the provenance stamp a pressed option button carried
         (see :func:`~kiro_crew.discord.renderer.session_provenance_tag`). When
@@ -687,7 +701,10 @@ class DiscordDispatcher:
         # destroyed they would compact or cancel the NATIVE DM session while the user
         # believes they drive the resumed one; deciding here makes that structural.
         route = RoutingDecision()
-        wants_routing = interpret_commands or bool(origin_tag)
+        # A message that arrives already pinned (a drain replay, the busy path's
+        # retry) is never routed again: routing is how a rebind that landed while
+        # it waited would carry it into another session. Its pin is validated below.
+        wants_routing = binding is None and (interpret_commands or bool(origin_tag))
         if wants_routing and cmd not in _DETACH_EXEMPT_COMMANDS:
             async with self._routing_turn(channel_id) as queued:
                 route = await self._session_resume.route(channel_id)
@@ -797,10 +814,16 @@ class DiscordDispatcher:
 
         # ── Mid-turn concurrency: check the CURRENT-generation key BEFORE any
         # idle/daily rotation (see the Telegram dispatcher's rationale). ──
-        # ``resumed_key`` comes from the decision above and is NOT re-resolved: a
-        # second resolver call let an unlink landing mid-decision route silently.
-        resumed_key = route.resumed_key
-        derived_session_key = resumed_key or self._session_key(user_id, thread_id)
+        # The pin is taken HERE, once, and is what every later step takes: the
+        # busy path and its retry, the queue entry. None of them re-resolves the
+        # binding -- a second resolver call is how an unlink landing mid-decision
+        # routed silently, and how a rebind landing during an awaited steer carried
+        # the retry into another session.
+        if binding is None:
+            binding = ResumeBinding.from_route(route)
+        binding = binding.at(native_session_key)
+        resumed_key = binding.resumed_key
+        derived_session_key = binding.session_key
         if monitor_session_key is not None:
             if monitor_completion is None or derived_session_key != monitor_session_key:
                 return MonitorDispatchResult.UNAVAILABLE
@@ -845,7 +868,7 @@ class DiscordDispatcher:
                 # stays for the cases the slot cannot take.
                 await self._handle_resumed_busy(session_key, msg, text, override_mode)
                 return monitor_result
-            await self._handle_busy(session_key, msg, text, override_mode)
+            await self._handle_busy(binding, msg, text, override_mode)
             return monitor_result
 
         if monitor_completion is None:
@@ -863,7 +886,11 @@ class DiscordDispatcher:
                 return MonitorDispatchResult.UNAVAILABLE
             session_key = monitor_session_key
         else:
-            session_key = resumed_key or self._session_key(user_id, thread_id)
+            # Rotation above may have bumped the native generation; the pin resolves
+            # against it (a resumed pin is unaffected). Still the same pin, never a
+            # second look at the binding.
+            binding = binding.at(self._session_key(user_id, thread_id))
+            session_key = binding.session_key
         if origin_tag and session_provenance_tag(session_key) != origin_tag:
             # REVALIDATE against the FINAL key: ``maybe_rotate`` above can bump
             # the native generation between the pre-busy gate and here, and the
@@ -1647,14 +1674,24 @@ class DiscordDispatcher:
 
     async def _handle_busy(
         self,
-        session_key: str,
+        binding: ResumeBinding,
         msg: InboundMessage,
         text: str,
         override_mode: str | None,
     ) -> None:
-        """A message arrived mid-turn: steer the running turn or queue it."""
+        """A message arrived mid-turn: steer the running turn or queue it.
+
+        *binding* is the pin the message was admitted with: it names the session
+        whose turn is running (this chat's own -- a resumed session's busy turn is
+        handed to the dashboard slot instead, see ``_handle_resumed_busy``), and
+        the retry after a false enqueue re-enters with it -- routing again there is
+        how a rebind landing during the awaited steer would carry the message into
+        another session (see ``handle_message``'s ``binding``).
+        """
         assert self.client is not None
         channel_id = msg.conversation_id
+        session_key = binding.session_key
+        assert session_key, "the pin is resolved at admission (ResumeBinding.at)"
         mode = override_mode or str(self._live_cfg().messaging.queue_mode)
         if mode != "queue" and not msg.attachments:
             provider = self.sessions.get_provider(session_key)
@@ -1685,7 +1722,7 @@ class DiscordDispatcher:
         # queue mode (or !queue override, or steer unavailable). Atomic
         # enqueue + receipt under self._queue.lock — see the Telegram dispatcher.
         if not await self._enqueue_with_receipt(
-            session_key,
+            binding,
             channel_id,
             text,
             attachments=msg.attachments,
@@ -1697,7 +1734,11 @@ class DiscordDispatcher:
             # channel and attributed to them.
             origin=_inbound_origin(msg),
         ):
-            await self.handle_message(msg)
+            # The turn ended in the window: run the message as a fresh turn, on the
+            # pin it was admitted with. Re-entering unpinned would route it again,
+            # and a rebind that landed during the awaited steer would then run and
+            # persist it in a session this message was never admitted for.
+            await self.handle_message(msg, binding=binding)
 
     async def _drain_queue(self, session_key: str) -> None:
         """Collapse every message ONE SENDER queued during the just-finished turn
@@ -1860,13 +1901,16 @@ class DiscordDispatcher:
                 ),
                 drain=False,
                 interpret_commands=False,
+                # Pinned native, like every entry this queue holds: commands off
+                # also means routing off, and the pin says so explicitly.
+                binding=ResumeBinding.for_replay(),
             )
 
     # ── Mid-turn queue receipt (single, in-place, persistent record) ───────
 
     async def _enqueue_with_receipt(
         self,
-        session_key: str,
+        binding: ResumeBinding,
         channel_id: str,
         text: str,
         *,
@@ -1881,8 +1925,12 @@ class DiscordDispatcher:
         its reply goes, and the drain replays the entry under it. A default would be
         a way to enqueue an unattributed message, which under
         ``dm_scope = "unified"`` the drain could only answer under someone else's
-        identity."""
+        identity.
+
+        *binding* is the pin the message was admitted with: the queue it joins is
+        that session's."""
         assert self.client is not None
+        session_key = binding.session_key
         async with self._queue.lock:
             if not self.sessions.enqueue(
                 session_key,

@@ -2746,22 +2746,52 @@ async def test_the_reply_leg_consults_the_fence_before_publishing(tmp_path):
     ), "a constraint that newly holds since that admission withholds the leg"
 
     src = Path(cr.__file__).read_text(encoding="utf-8")
-    deliver_calls = [
-        line
-        for line in src.splitlines()
-        if "await _deliver_cross_surface_reply(" in line and not line.strip().startswith("#")
-    ]
+    lines = [line for line in src.splitlines() if not line.strip().startswith("#")]
+    # The transport leg is called from exactly ONE place: the fenced publication
+    # helper. Anything else that wants the channel-neutral leg goes through that
+    # helper and inherits the fence, so a new publication cannot skip it.
+    deliver_calls = [line for line in lines if "await _deliver_cross_surface_reply(" in line]
     assert len(deliver_calls) == 1, (
-        "one channel-neutral call site only; a second would need its own fence "
-        f"check: {deliver_calls}"
+        "one channel-neutral call site only, inside _publish_cross_surface_reply; a "
+        f"second would bypass the fence: {deliver_calls}"
     )
+    helper_src = src[src.index("async def _publish_cross_surface_reply(") :]
+    helper_src = helper_src[: helper_src.index("\nasync def ", 1)]
+    assert "await _deliver_cross_surface_reply(" in helper_src
+    assert "cross_surface_withheld(state, slot)" in helper_src
+    # The publishers, by name: the turn's completed reply and the linked-conversation
+    # command refusal. A third publisher is fine only if it is listed here.
+    publish_calls = [line for line in lines if "await _publish_cross_surface_reply(" in line]
+    assert sorted(line.strip() for line in publish_calls) == sorted(
+        [
+            "await _publish_cross_surface_reply(state, slot, session_key, assistant_text)",
+            "await _publish_cross_surface_reply(state, slot, session_key, _channel_notice)",
+        ]
+    ), f"unexpected publishers of the channel-neutral leg: {publish_calls}"
     # EVERY cross-surface publication asks, not just the channel-neutral leg: Slack
-    # is an audience too, and it resolves its thread owner live. Four sites -- the
-    # channel-neutral reply, the Slack reply, the mid-turn tool stream, and the
-    # teardown's final task append, which would otherwise publish a title whose
-    # in-progress append was withheld.
+    # is an audience too, and it resolves its thread owner live. The fence is asked
+    # at five sites: the channel-neutral publication helper, the mid-turn tool
+    # stream, the reply with its options, the teardown's final task append (which
+    # would otherwise publish a title whose in-progress append was withheld), and
+    # the linked-conversation command refusal's Slack notice, which posts to the
+    # slot's cached thread before the turn's try/finally.
     asks = src.count("cross_surface_withheld(state, slot)")
-    assert asks == 4, f"expected four fenced publication sites, found {asks}"
+    assert (
+        asks == 5
+    ), f"expected the fence at the neutral publisher and four Slack sites, found {asks}"
+    # The refusal's Slack leg, by shape: the fence is in the SAME condition as the
+    # send, not a separate statement a later edit can lose -- and the condition is
+    # the RECIPIENT re-decision (governance, then the stamped principal against the
+    # live roster, ``_slack_recipient_permitted``), not governance alone.
+    assert (
+        "        if _slack_recipient_permitted and not cross_surface_withheld(state, slot):\n"
+        "            await _deliver_linked_slack_message("
+        "state, slot, sessions, session_key, _channel_notice)"
+    ) in src, "the command refusal's Slack notice must sit behind the steer-audience fence"
+    assert "_sc.slack_recipient_still_allowed," in src, (
+        "the command refusal's Slack notice must re-decide the stamped principal through "
+        "the shared spelling the drop notice uses"
+    )
 
 
 @pytest.mark.asyncio
@@ -5915,3 +5945,70 @@ async def test_a_requeue_onto_a_replaced_slot_is_refused_not_reported_as_sent(
         "a requeue onto a detached slot must be refused as target_moved, not "
         f"reported as delivered: {caught.value.code}"
     )
+
+
+class TestSlackRecipientStillAllowed:
+    """``slack_recipient_still_allowed`` is the ONE spelling of the recipient
+    re-decision both Slack egresses on a stamped entry's behalf take -- the drop
+    notice and the channel-command refusal notice -- so it must answer exactly as
+    the ladder leg does for every other channel: through ``_authorize_recipient``
+    over the LIVE roster, denial SEL-audited, fail-closed on an empty principal and
+    on a raising check."""
+
+    @staticmethod
+    def _link() -> "sc.ChannelLink":
+        return sc.ChannelLink("slack", channel_id="C0FFEE", thread_id="1758.0001")
+
+    def test_an_author_still_on_the_roster_is_allowed(self, monkeypatch):
+        import kiro_crew.slack.handler as slack_handler
+
+        seen: list[str] = []
+        monkeypatch.setattr(slack_handler, "is_allowed_user", lambda u: seen.append(u) or True)
+        monkeypatch.setattr(cr, "sel", lambda: MagicMock())
+        assert sc.slack_recipient_still_allowed(self._link(), "U0WNER", session_key="dashboard:s")
+        assert seen == ["U0WNER"]
+
+    def test_a_revoked_author_is_denied_and_the_denial_is_audited(self, monkeypatch):
+        import kiro_crew.slack.handler as slack_handler
+
+        monkeypatch.setattr(slack_handler, "is_allowed_user", lambda u: False)
+        sink = MagicMock()
+        monkeypatch.setattr(cr, "sel", lambda: sink)
+        assert (
+            sc.slack_recipient_still_allowed(self._link(), "U0WNER", session_key="dashboard:s")
+            is False
+        )
+        row = sink.log_api_access.call_args.kwargs
+        assert row["operation"] == "channel.proactive_send_authorize"
+        assert row["outcome"] == "denied" and row["source"] == "slack"
+        assert row["resources"] == "dashboard:s -> slack"
+
+    @pytest.mark.parametrize("principal", ["", None])
+    def test_an_empty_principal_fails_closed_without_asking_the_roster(
+        self, monkeypatch, principal
+    ):
+        import kiro_crew.slack.handler as slack_handler
+
+        asked: list[str] = []
+        monkeypatch.setattr(slack_handler, "is_allowed_user", lambda u: asked.append(u) or True)
+        monkeypatch.setattr(cr, "sel", lambda: MagicMock())
+        assert (
+            sc.slack_recipient_still_allowed(self._link(), principal, session_key="dashboard:s")
+            is False
+        )
+        assert asked == []
+
+    def test_a_raising_roster_authorizes_nobody(self, monkeypatch):
+        import kiro_crew.slack.handler as slack_handler
+
+        def _boom(_u):
+            raise RuntimeError("roster unavailable")
+
+        monkeypatch.setattr(slack_handler, "is_allowed_user", _boom)
+        sink = MagicMock()
+        monkeypatch.setattr(cr, "sel", lambda: sink)
+        assert (
+            sc.slack_recipient_still_allowed(self._link(), "U0WNER", session_key="dashboard:s")
+            is False
+        )
+        assert sink.log_api_access.call_args.kwargs["outcome"] == "denied"

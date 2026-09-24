@@ -253,8 +253,11 @@ or redispatch.
 The structured monitor controller probes before entering any channel turn.
 The authenticated creation surface is carried through native channel directives and
 through linked dashboard-slot turns, including queued/recovered turns, then persisted
-on the monitor. A merged queue batch retains channel provenance when any consumed item
-came from a channel; dashboard input in the same batch cannot widen the entire turn.
+on the monitor. The drain's merge folds only entries of one origin
+(`chat_utils.merge_origin`), so a merged queue batch is never channel and dashboard
+input together; the reduction that retains channel provenance when any consumed item
+came from a channel stays as the fail-closed reading, so dashboard input in a batch
+could never widen the entire turn.
 Credential authority therefore follows the producer surface rather than the storage
 slot key; linking a channel thread to a dashboard chat cannot promote that
 channel-created monitor to dashboard owner credentials.
@@ -1492,8 +1495,9 @@ opening the dashboard:
 - A message queued while a native Telegram turn is busy keeps native affinity when
   it drains (`interpret_commands=False` skips resume resolution). A `/session` bind
   created after enqueue therefore cannot redirect already-queued text into the
-  selected dashboard conversation. Busy resumed sessions refuse a second message
-  instead of queuing it, so the exception cannot strand resumed work.
+  selected dashboard conversation. A message queued while a RESUMED session is
+  busy records that session on its entry and drains back into it -- see
+  [A busy resumed session](#a-busy-resumed-session); it is never refused.
 - Every `/model` picker records its exact target session and re-resolves the current
   binding on press. `/new`, `/unlink`, an agent switch, or any rebind invalidates the
   old picker before `session/set_model`; only a native picker stores the route-level
@@ -2040,6 +2044,384 @@ The combined turn itself runs outside `ReceiptQueue.lock`, and the drain replays
 bypass both the command intercept and override parsing, so a queued `/new`
 reaches the model as literal text instead of executing on drain.
 
+### A busy resumed session
+
+A conversation bound to a dashboard session through the channel's session-switch
+command (`/session` on Telegram, `!sessions` on Discord, `/sessions` on Teams)
+runs its turns under that `dashboard:` key -- and so do the dashboard's own: the
+composer, a `session_send` from a peer, a cron injection. A message arriving while
+that session is mid-turn is handed to the **dashboard slot's own mid-turn
+machinery** -- steered or queued there, with the slot's own refusals for what it
+cannot take -- and WHO holds the turn decides what that machinery can do:
+
+- **This channel holds it** (the channel's own turn is running on the resumed key):
+  the slot reads idle from the dashboard's side -- it has no published client to
+  steer into and no drain coming -- so the hand-off refuses
+  (`channel_handoff.REFUSED_IDLE`, worded as the resumed-busy refusal: send it
+  again once the turn finishes, or unlink). The channel's OWN queue is never used
+  for a resumed session: it is drained only at the tail of a channel-driven turn
+  and the replay dispatches with routing off, so a drained item's affinity is
+  native by construction. The pin that threads a message's target through the
+  dispatchers (`session_resume.ResumeBinding`, frozen) therefore names a RESUMED
+  session only for a live message: a fresh message pins itself at admission from
+  the routing decision (`ResumeBinding.from_route`), a drained entry arrives pinned
+  natively (`ResumeBinding.for_replay`). Supplying a pin turns routing OFF, and
+  every later step takes the pin object rather than a loose key -- `_handle_busy`,
+  `_enqueue_with_receipt`, the retry after a false enqueue
+  (`handle_message(msg, binding=binding)`), Teams's `_run_turn` -- so no call site
+  can route unpinned (`test_resume_binding_threading.py` reads the three
+  dispatchers' source and asserts it). The pin exists because a drain replays with
+  commands off, which also skips resume routing, and the pin says so explicitly;
+  and because a retry that re-routed after a rebind landed during the awaited
+  steer would run and persist the message in the session the conversation had just
+  moved to -- a live message runs where it was admitted, never re-routed and never
+  dropped. `ResumeBinding.is_replay` tells a drained entry from a live message for
+  the one reading a replay gets that a live message does not: Telegram re-parses a
+  privacy modifier left at the head of a drained entry's text. The per-turn
+  origin-mirror re-assert (`link.bind_origin_mirror`) runs for NATIVE turns only on
+  every channel that resumes: a resumed dashboard session already owns its surface
+  and binding.
+- **The dashboard holds it**: the channel queue is the wrong place to wait, because
+  it is drained only from the tail of a channel-driven turn and the dashboard turn
+  loop knows nothing of it -- an entry left there would run out of order after some
+  later channel turn, or never. So the message is handed to the slot's OWN mid-turn
+  machinery (`dashboard/channel_handoff.py::hand_to_resumed_slot`, the hand-off
+  the section "A busy RESUMED dashboard session takes the slot's own machinery"
+  specifies): under the channel's own mode ladder it is **steered** into the
+  running turn through the slot's published client, recording the audience fence,
+  or **queued** on the slot's queue (`chat_delivery.queue_for_next_turn`), stamped
+  `directive_user_origin` (an allow-listed human typed it into the bound
+  conversation) and `directive_channel_origin` (that conversation is a channel, so
+  a directive derived from it keeps channel authority) with the admission
+  containment recorded -- `linked` is already held, so the drain's re-validation
+  drops it only for a constraint that appears afterwards -- and with the sending
+  conversation as the entry's **recipient stamp**
+  (`session_control.CHANNEL_RECIPIENT_META_KEY`: channel type, conversation id,
+  the platform user the channel admitted, and the thread for a channel whose room
+  is a thread). It runs as the next dashboard turn in arrival order behind whatever
+  the composer queued. Every outcome is confirmed in the conversation with that
+  channel's own words (steered; queued; queued by a close or run by a successor
+  when the slot moved under the steer RPC), because a dashboard-driven turn's
+  reply reaches the conversation, if at all, through the session's outbound
+  mirror and never through the channel's dispatcher. The refusals are the slot's
+  (`channel_handoff.REFUSED_*`, each worded per channel): no open slot, a closing
+  or remote-bound slot, a lease held by something other than the dashboard turn
+  loop (the channel's own turn on the resumed key), attachments (neither arm can
+  carry channel attachment material, which the channel turn downloads and the
+  dashboard drain has no reader for), a slot that moved under the RPC with the
+  text held only in memory, and a live queue already at `MAX_LIVE_QUEUE_ENTRIES`
+  (`REFUSED_QUEUE_FULL`; the linked-thread intercept refuses into its thread):
+  the queue's bound is held at admission by every producer, so a channel
+  conversation cannot grow a slot's queue without limit during one busy turn.
+  Discord, Telegram and Teams -- the channels that resume dashboard sessions --
+  all take this arm (`_handle_resumed_busy` on each dispatcher); the remaining
+  channels have no resumed sessions, so the question does not arise.
+  Slack's linked-thread intercept (`slack/handler.py`) is the same contract from
+  the thread's side: it hands a linked thread's message to the slot queue through
+  the same producer, with both provenance flags and the thread stamped as the
+  entry's recipient, so the drain contract below covers a Slack thread too. A
+  queued Slack message is rendered ONCE: the producer's queue card stands for it
+  while it waits and the drain writes its user row when it runs, exactly as a
+  composer-queued send is; the intercept appends the user row itself only when it
+  runs the turn immediately, and then it tells the turn the text is the thread's
+  own words (`_run_chat`'s `_channel_message`), so a leading command word is
+  refused into the thread exactly as a drained hand-off's is. Which arm is the
+  discriminator the slot path reads (`channel_handoff.slot_unable_to_take`:
+  `slot.running or slot._in_stage_execution`), never `running` alone: between two
+  stages of a live plan the task is briefly clear while `_in_stage_execution`
+  holds, and a thread message landing then waits in the queue rather than
+  starting a concurrent turn over the plan's own. Whatever arm runs a channel
+  turn, its quick-prompt macro (`/plain`) is classified from the token as typed
+  (`chat_utils.opens_with_quick_prompt`), not from the command word the turn has
+  blanked: the macro is a replacing expansion on every surface, so the `$skill`
+  gate skips it for a linked conversation exactly as for the composer.
+
+Four further properties the arm has to hold, each pinned by a test:
+
+- **The handed-off text is prose on the dashboard.** The entry runs through the
+  dashboard turn loop, which reads a leading `/token` as a command, so a channel
+  message could otherwise run `/workflow`, `/goal` or a harness command on the
+  dashboard owner's authority -- authority that channel never offered its user, and
+  that natively the same text never gets (the channel forwards it to the model as
+  text). `chat_utils.dashboard_command_word` returns `""` for a
+  `directive_channel_origin` turn, so such a turn has no command word at all.
+  Prose is the right reading; silence is not. A leading token the dashboard WOULD
+  have run from its own composer (`chat_utils.suppressed_channel_command`: a
+  member of its command set, any slash under `claude_code`; a quick prompt such as
+  `/plain` is a prose shortcut and stays prose)
+  is refused with `CHANNEL_COMMAND_UNAVAILABLE` rather than streamed to the model
+  as text -- the person who typed `/compact` into a linked thread would otherwise
+  wait for a compaction that never comes -- and the notice is posted to the
+  conversation that typed it through the same legs a turn's reply takes, through
+  the reply's own fenced publication site (`chat_runner._publish_cross_surface_reply`,
+  the turn runner's one caller of the channel-neutral transport leg), so a steer-audience fence
+  that withholds the reply withholds this notice too. The Slack leg
+  (`_deliver_linked_slack_message`) asks the channels-scope governance gate first
+  (`channel_egress_permitted`, off the loop, fail closed), like every proactive
+  channel egress: the command may have been queued while the scope was permitted,
+  and a denial landing before the drain holds at this post. It then re-decides the
+  RECIPIENT the way the drop notice's Slack leg does, through the one spelling both
+  share (`session_control.slack_recipient_still_allowed`: `_authorize_recipient`
+  over Slack's LIVE roster, the denial SEL-audited): the principal stamped on the
+  consumed entry -- handed to the turn by the drain as `_channel_recipient`, and by
+  the thread intercept for the message it runs directly -- may have been removed
+  from the roster while the command waited, and then the thread gets nothing while
+  the transcript keeps the notice. A turn handed no Slack stamp (words the gateway
+  could not place with a Slack conversation, or a drained run naming two) posts
+  nowhere on Slack: there is nobody identifiable to post to. The token
+  is named through the same two redactors the intercept runs on the user's message
+  and cut to `CHANNEL_COMMAND_TOKEN_MAX` (`chat_utils.displayable_channel_command`):
+  under `claude_code` it is the user's own text, and the notice, the audit row and
+  the Slack post must not hand it back around that redaction. A leading
+  token no surface reads as a command stays prose -- and so does a path-shaped one
+  on every provider (`chat_utils._path_shaped`: a second `/` or a `.` past the first
+  character), because `claude_code` forwards ANY leading slash from the composer and
+  would otherwise refuse a channel message that merely opens with
+  `/usr/bin/python3`.
+- **An entry does not outlive its binding.** The binding IS the entry's reply route
+  (a resume is an inbound-capable mirror link), so the recipient stamp records the
+  conversation on the entry (`CHANNEL_RECIPIENT_META_KEY`) and the drain's
+  re-validation drops the entry when that mirror is gone at delivery
+  (`session_control.channel_recipient_released`, reported as the `unlinked`
+  constraint) -- asked of the entry's OWN room (`session_control.mirror_room`)
+  against the rooms the probe names now, not of whether any mirror survives: a
+  session can hold two rooms (a Telegram mirror beside a Slack thread), and the
+  sender's room leaving while the other stays is a narrowing to
+  `newly_held_constraints` but the lost reply route to this entry. A mirror moved
+  to a different conversation is the existing `mirror_retarget` constraint.
+  Entries without the stamp -- composer text, peer sends, automation -- are
+  unaffected: for them a mirror disappearing costs no reply route. The drain's
+  merge (`dashboard.merge_queued_messages`, default off) honours the same
+  boundary: `chat_utils._dequeue_next_message` partitions the queue by origin
+  (`chat_utils.merge_origin`) and folds only the head's own-origin run -- entries
+  stamped for the same conversation (its room as `mirror_room` spells it) and the
+  same admitted sender -- so a merged turn answers one conversation, a refusable
+  command word keeps the leading position its refusal keys on, and a drop notice's
+  recipient re-decision over the stamp is exact for every folded entry. An entry
+  of another origin -- another room, the dashboard's own text, or channel text the
+  gateway cannot place (no stamp, or a restored entry with no verifiable
+  provenance) -- stays queued and drains in its own turn, in order.
+  Across a gateway restart the
+  stamp AND the entry's admission-time containment snapshot are worth only what
+  the gateway's own proof over them says. The persisted queue line is an editable
+  file, so `sanitize_restored_queue` (pure) strips both with the sender stamp and
+  the flags, and `restore_queue_provenance` puts both back when the record's
+  proof verifies, BEFORE the drain re-validates: a hand-off queued before the
+  restart comes back exactly as it was queued, so into a session still bound it
+  drains, into a session whose binding changed it is dropped WITH the notice to
+  the conversation, and a record with no proof or a failing one (a stamp or
+  snapshot rewritten, a proof transplanted) comes back stripped and fails closed
+  against the constraints that hold now, with the dashboard notice only -- so a
+  notice is never sent wherever an edited line points. What the durable record
+  carries (`slot_queue_repository.ORIGIN_PROOF_KEY`) is the RECORD SEAL
+  (`queue_origin_token.queue_record_seal`, under its own domain tag): an HMAC
+  over the slot key, the write's generation (`ORIGIN_GENERATION_KEY`, a nonce the
+  slot mints whenever the durable value changes and every record of the write
+  names), the queue id, the content, the recipient stamp (none for dashboard text)
+  and the snapshot, keyed from the fenced dashboard signing secret
+  (`token_signing.key`, unreadable and unwritable by agent tools). The live
+  attestation beside the queue (`queue_provenance_proof`) is the same without the
+  generation; the writer seals an attested record under the write's generation and
+  the restore mints the attestation back from a verified seal. A seal is good for
+  one record of the write the gateway committed last: the save commits the
+  generation OUTSIDE the transcript, in the fenced `queue-generations` crew-home
+  leaf (`queue_generation_store`, masked from every sandbox and fenced from the
+  file tools like `tag-grants`), in two writes around the line's own -- the
+  generation the line is about to carry is recorded as PENDING beside the
+  committed one before the line is written (`stage_pending_generation`), and
+  committed, every pending one pruned, once the line is on disk
+  (`commit_queue_generation`) -- and the restore honours a line only when its one
+  generation is the committed one, or one of the pending ones: a save cut short
+  between its line and its commit left exactly that, and the line is honoured with its
+  commit OWED (the restore leaves the queue owed, `queue_persist_pending`, so the
+  next flush pass re-saves and commits it; without the pending write that
+  ordinary interruption read as a tamper and dropped the queue). The pending
+  generations are a LIST, appended to and bounded (the newest kept; the committed
+  generation is its own field and the bound never touches it), because a
+  commit can be refused with its line already on disk: a retry whose value MOVED
+  mints a fresh generation (one per write of a moved value, never reused for changed
+  content) and stages it before writing, and until its line lands the line on disk is
+  still sealed under the previous one -- a stage that replaced the pending generation
+  dropped it while its line stood, and a process lost there restored the gateway's
+  own last write as a tamper; carried, it stays honoured until the commit that lands
+  prunes the list, after which that line put back whole is the rollback the store
+  exists to refuse. The list grows only with LANDED lines of moved values, so the
+  oldest it drops is a line since replaced on disk: a retry of the SAME value keeps
+  the generation the line already names and stages nothing
+  (`_ChatSlot.begin_durable_queue_write` over the value that generation seals,
+  `_queue_generation_sig`, which the save stamps right before each line write), and
+  a line write that FAILS after its stage takes that stage back
+  (`unstage_pending_generation`: only the generation this write staged, the committed
+  one and every older pending one kept). Without both, an outage in which the
+  transcript could not be written minted and staged one generation per retry,
+  and the bound evicted the one the line on disk was sealed under -- a restart
+  during the outage then rejected the gateway's own last write and dropped its
+  acknowledged prompts. A REFUSED commit -- the store's record could not be written, or
+  the line names no incarnation for it to bind to -- leaves the queue owed AND is
+  reported: the save raises (at both of its commit sites, the full save's and the
+  empty-window merge's, on the path that already raises for an unreadable record),
+  after the line's own write and its cache invalidation, so the caller's contract
+  schedules the retry -- a best-effort save marks the slot dirty and the periodic
+  flush re-saves and commits; an archival save (the close, `best_effort=False`)
+  fails with `history_save_failed`, the close's own failure arm puts the popped slot
+  back with its queue, and the tab stays until a close lands the commit. Returning
+  success there was the loss the record exists to prevent, reached without any
+  tampering: the close removed the tab over a queue the store did not name, the
+  flush that owed the retry never visits a popped slot, and the next reopen dropped
+  the acknowledged prompts under the tamper notice (a store that could not be
+  written holds the previous generation or nothing) with the sender told of a loss
+  the close had reported as a success. So, told against
+  a record the store holds for the transcript, a line rolled back whole to an
+  older write (every seal on it verifying under its own generation, a consumed
+  `/goal` among them), a line carrying two generations, and a line stripped of
+  every seal and generation are each rejected whole and dropped with the dashboard
+  notice that its stored record was changed by something other than this gateway.
+  A line that carries a generation while the store holds NO record for the
+  transcript -- none (a line older than the store; a save whose pending write was
+  itself refused and which was then cut short; a queue written by the
+  empty-window merge's heal of a CORRUPT first line, which per
+  [history.md](history.md) carries no `created_at` because the identity is
+  unknowable, so that merge stamps none and stages nothing, and the queue stays
+  owed to the next pass over the now-readable line -- a pass the merge's raise
+  reports as owed rather than leaves to chance) or one for another
+  incarnation of it (a transcript put back from a copy, a reused slot key) -- is
+  the third outcome: nothing on it was altered and nothing on it can be honoured, so it is
+  dropped the same way but under its own notice ("this gateway kept no record of
+  the durable write it was restored from", `generation_unrecorded`), never the
+  tamper wording, and logged once at info as the expected state it is. A record is
+  keyed by the transcript's own slot name -- `state.queue_record_key` of the
+  history key the line is written under: `transcript_slot_name` (ONE prefix
+  stripped) folded through `_normalize_slot_key`, so a bound channel slot's live
+  key `slack:<ts>` (the save's history key) and the transcript's filename stem
+  `slack_<ts>` (every restore's) name one record -- at every site (the
+  save, the restore, the permanent delete), never by the live slot's raw key: the
+  history layer strips every `dashboard_` prefix when it builds a history key, so
+  slot keys `x` and `dashboard_x` share the transcript `dashboard:x`, and a record
+  written under `dashboard_x` would outlive that transcript's deletion and be read
+  back honoured by an open-slots rehydrate of the stacked key; unfolded, a channel
+  slot's record sat under a spelling no restore read and its queued messages were
+  dropped as unrecorded at the first drain after every restart. Every attestation
+  and record seal is minted and verified under that same name
+  (`_ChatSlot.queue_seal_key`, `slot_queue_repository.seal_key_of`), never under
+  the live slot's raw key: a restore recreates the slot under the transcript's
+  name, so a seal keyed by `dashboard_x` would fail to verify on `x` and the queue
+  would be dropped under a tamper notice it did not earn. The two verifiers
+  (`queue_record_seal_matches`, `queue_provenance_matches`) never raise: a tag
+  that is not a string, or carries a non-ASCII character (which the constant-time
+  comparison refuses to compare), is a tamper answered False, the rule
+  `token_auth._ct_eq` and `platform/admission._signature_valid` already apply --
+  one edited seal on one line cannot abort a session restore. A record is
+  good for one transcript
+  incarnation (the metadata line's `created_at`), and the permanent delete
+  tombstones it in two phases so a refused delete never costs the surviving
+  transcript its queue: the record is moved aside by one rename before the ledger
+  exclusion and the unlink (a move that fails refuses the delete with the row
+  intact, HTTP 409 `queue_generation_tombstone_unwritable`), moved back when any
+  later step refuses, and unlinked only once the transcript is gone
+  (`queue_generation_store.stage_queue_generation_tombstone`,
+  `handlers/sessions._delete_history_session`). The save credits the queue as persisted only
+  once the store names the line's generation: a refused store write leaves the
+  queue owed (`queue_persist_pending`), so the next flush pass re-saves the line and
+  retries the commit rather than publishing a line the restore would reject. The
+  attestation is stamped by the queue
+  repository on every durable entry it accepts except channel text with no
+  conversation stamped on it, re-signed when the dashboard edits one, and held in a
+  per-slot store bounded to the durable window with a single writer
+  (`MAX_ORIGIN_PROOFS`, `_record_provenance`); the proof set follows the window,
+  not the order entries arrived in -- a tail entry the head drains into the window
+  is attested by the save INSIDE its proven queue/window pair (`reattest_durable_window`,
+  run by `begin_durable_queue_write` at the start of each attempt and again right
+  before the attempt's confirming read, so a drain that promoted an unsealed entry
+  after the first pass reads as a disagreement and the attempt is retried, never
+  written), so it is written sealed, and a restored entry's
+  proof, which this process cannot re-mint, is kept while the entry is queued.
+  That save runs in the flush executor thread, so the store has two writing
+  threads -- the loop's stamp and forget, the flush's reattestation -- and each
+  holds the slot's sidecar lock (`_provenance_lock`, a thread lock; the slot's
+  `_lock` is an asyncio lock the executor cannot take) across its window read and
+  its write: neither thread iterates a dict the other is writing, and neither
+  prunes with a window the other has moved past. Readers stay lock-free (one key
+  at a time). The
+  same proof decides command authority, by DEFAULT rather than by any marker: the
+  drain (`_start_next_queued_turn`) treats a restored entry as unproven prose --
+  no composer command word, so a leading `/workflow` is text the turn reads rather
+  than a command it runs; and, with no conversation address on it, not a channel
+  message either, so it is not refused as one --
+  unless an ADDRESS-LESS proof verifies against it. So a channel hand-off comes
+  back as channel text however its persisted line is edited (its proof, when it
+  has one, is over its address), a composer-queued command keeps its command word
+  through a restart because its proof still verifies, and a dashboard entry whose
+  words were rewritten on disk, or whose proof was transplanted from another entry
+  or slot, comes back as prose too. The proof and the stamps are queue plumbing:
+  the drain keeps them off the transcript row.
+- **The drop reaches the person who sent it.** The dashboard's own drop notice lands
+  on the slot transcript, which the channel user is not reading, and its sender
+  notice keys on a sender SLOT, which a channel has none of. So the conversation is
+  told through its own transport (`session_control.notify_channel_recipient_dropped`,
+  addressed from the entry's stamp because the live link is exactly what may be gone), through the
+  same governed cross-surface ladder every proactive leg walks -- channel-scope
+  governance and the recipient allow-list are re-checked at send time. The ladder is
+  asked with the platform user the dispatcher admitted the message from, which the
+  stamp carries beside the address (its `principal`): a `dashboard:`
+  session key names nobody, and a DM is judged against a roster of users, so
+  without it every DM notice would be refused. Stamped for a DM route ONLY, the
+  rule the spool replay follows: a thread is authorized by the thread roster and
+  nothing else, and Discord's `may_send_to` falls from a thread not in its roster
+  to the DM arm, so a sender stamped on a thread entry would authorize the notice
+  into a thread revoked while the message waited. A Slack
+  thread is the one address that ladder answers `None` for by design (Slack's
+  dedicated client is not a registered transport), so it is posted through that
+  client at the stamped thread instead -- after the same two decisions the ladder
+  takes: the channels-scope governance gate (`chat_runner.channel_egress_permitted`,
+  SEL-audited, fail-closed), so a session whose profile denies the
+  `channels`/`slack` scope is not posted into by that client either, and the
+  RECIPIENT re-decision from the principal the intercept stamped at admission
+  against Slack's live owner roster (`chat_runner._authorize_recipient` over
+  `session_control._LiveSlackRoster`, `may_send_to`'s shape: empty or revoked fails
+  closed, the denial SEL-audited like the ladder's), so a sender revoked between
+  admission and drop -- the stamp survives a restart, the roster edit is what a
+  restart applies -- is told nothing rather than posted to from the stale
+  admission. Best-effort,
+  like every other drop notice: withholding the message is the authorization
+  decision and never waits on the report, and the notice task is held on the
+  state's background set until it finishes so it cannot be collected mid-send. The
+  receipt therefore promises a wait and a condition, not delivery.
+- **A privacy modifier is never silently swallowed, and never persisted.** Telegram
+  refuses `/temporary <msg>` and `/incognito <msg>` outright while a session is
+  resumed (a dashboard slot owns its `memory_mode`), and the hand-off refuses one
+  too should a caller ever carry it in, with the same words: the slot's queue is
+  written to disk, so queueing the text would persist what the user marked private.
+  Nothing reaches the slot. A drained entry whose text still opens with the
+  modifier (queued by a producer that did not strip it) has it parsed off on the
+  replay path as well (`ResumeBinding.is_replay`) and applied to the native session
+  the entry replays in, with the turn not persisted.
+
+### Channel commands outrank the busy path
+
+The command intercept runs BEFORE the busy check on every channel, so a command
+typed while the bound session -- native OR resumed, in steer OR queue mode -- is
+mid-turn is executed by the gateway and is never queued or steered into the turn
+as text. The session-switch command is the case that matters most: a user who asked
+`who pinged me on slack today`, sees the agent busy checking, and types
+`/session <other> issue` gets the picker for the query `<other> issue` (the
+command's own grammar) and the conversation moves; nothing lands in the busy turn.
+`/new`, `/stop`, `/unlink`, `/help` and the rest behave the same. `pre_turn.py`
+states the ordering for the channels that route through `resolve_pre_turn`;
+Discord, Telegram and Teams own their ladders and keep the same order. Pinned per
+channel in `test_telegram_sessions.py`, `test_discord.py`, `test_teams_midturn.py`,
+`test_webex_dispatch.py`, `test_wecom_dispatch.py`, `test_weixin_dispatch.py`,
+`test_imessage_dispatch.py`, `test_whatsapp_dispatch.py` and
+`test_feishu_dispatch.py`.
+
+What still decides steer-vs-queue for a channel message is the static
+`messaging.queue_mode` plus the per-message overrides below -- when the CHANNEL
+holds the turn. When the DASHBOARD holds the turn of a resumed session, the message
+is always queued for the next turn (a dashboard turn cannot be steered from a
+channel), whatever `queue_mode` or a `steer` prefix says, and the channel's receipt
+says so ("queued (not steered)"). The dashboard's
+`message.steer` decision point is not yet wired for channels; what that would take
+is recorded in [decisions](decisions.md#10-mid-turn-handling-messagesteer).
+
 ### Per-message overrides
 
 A `steer` / `queue` directive prefix forces that one message down the
@@ -2078,7 +2460,7 @@ because a `/`-leading message the client did send is more likely a path than a
 command, and it defers to `parse_command` and the directive alias sets so a real
 command can never be answered with the card.
 
-### A busy RESUMED dashboard session takes the slot's own machinery (Discord)
+### A busy RESUMED dashboard session takes the slot's own machinery
 
 A DM bound to a dashboard session (`!sessions`, or the dashboard's mirror menu)
 that messages that session mid-turn cannot use the channel's steer/queue above:
@@ -2246,7 +2628,10 @@ that names them: `_session/steer` carries text only, and the slot's queue cannot
 carry Discord attachment material (temp files owned by the consuming turn, which
 the dashboard drain has no hook to own), so the files stay with the user instead
 of being dropped or answered without. Discord-native conversations keep
-`_handle_busy` unchanged; Telegram's resumed branch still refuses.
+`_handle_busy` unchanged. Telegram and Teams take the same path for their resumed
+sessions (`_handle_resumed_busy` on each dispatcher, worded for its surface); the
+queue arm's entry carries the sending conversation as its recipient stamp on every
+channel (see "A busy resumed session" above).
 
 ### Hard cancel: `/stop`
 

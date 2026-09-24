@@ -31,7 +31,7 @@ import asyncio
 import dataclasses
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, Protocol
 
 from kiro_crew.history import (
@@ -150,6 +150,59 @@ def session_title_of(conv_log: Any | None, session_key: str, channel: str = "") 
 
 class ResumeReleaseError(RuntimeError):
     """A resumed binding removal could not be made durable."""
+
+
+@dataclass(frozen=True)
+class ResumeBinding:
+    """The session a message was admitted for, pinned once and threaded everywhere.
+
+    Every dispatcher decides WHERE a message runs exactly once, at admission: a
+    fresh message from the routing decision, a queue replay natively (the channel
+    queue holds native affinity only -- a message into a busy RESUMED session goes
+    to the dashboard slot's own machinery, never to this queue). That decision is
+    this object, and every later step that could route the message takes it -- the
+    steer-or-queue busy path, the queue entry, the retry after a false enqueue --
+    so none of them re-reads the live binding to decide a target: a rebind that
+    lands during an awaited step is never followed, and the retry after a false
+    enqueue runs where the message was admitted rather than in a session the
+    conversation has since bound.
+
+    ``resumed_key`` is the resumed session, or ``None`` for the conversation's own
+    (native) session. ``session_key`` is the session the message runs in, resolved
+    by the dispatcher's admission (:meth:`at`) from the pin and the conversation's
+    own current key, so no helper downstream derives a key of its own.
+    ``is_replay`` tells a drained QUEUE ENTRY from a live message, for the readings
+    a replay gets that a live message does not (Telegram re-parses a privacy
+    modifier left at the head of a drained entry's text).
+    """
+
+    resumed_key: str | None
+    session_key: str = ""
+    is_replay: bool = False
+
+    @classmethod
+    def from_route(cls, route: "RoutingDecision") -> "ResumeBinding":
+        """Pin a fresh message to the routing decision just taken for it."""
+        return cls(resumed_key=route.resumed_key)
+
+    @classmethod
+    def for_replay(cls) -> "ResumeBinding":
+        """Pin a drained entry natively: the channel queue holds no other affinity."""
+        return cls(resumed_key=None, is_replay=True)
+
+    @property
+    def pinned(self) -> bool:
+        """Whether this binding names a RESUMED session (as opposed to native)."""
+        return self.resumed_key is not None
+
+    def at(self, native_key: str) -> "ResumeBinding":
+        """The pin with its session resolved: the resumed key, else *native_key*.
+
+        Called once per admission, after the conversation's own key is known; a
+        re-entry (the busy path's retry) resolves again, so rotation of the native
+        session applies to it exactly as to any fresh turn.
+        """
+        return replace(self, session_key=self.resumed_key or native_key)
 
 
 @dataclass(frozen=True)

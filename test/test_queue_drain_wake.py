@@ -28,11 +28,13 @@ from kiro_crew.messaging.queue_drain import (
     reset_drains,
     wake_other_drains,
 )
+from kiro_crew.messaging.session_resume import ResumeBinding
 from kiro_crew.telegram.transport import TelegramInboundMessage
 
 #: The key every allow-listed person's DM collapses onto under a unified scope. Derived
 #: rather than spelled, so a change to the key shape moves these tests with it.
 _UNIFIED = build_dm_session_key("telegram", "kirocrew", "7", dm_scope="unified", chat_type="direct")
+_PIN = ResumeBinding(resumed_key=None).at(_UNIFIED)
 
 
 @pytest.fixture(autouse=True)
@@ -381,10 +383,10 @@ class TestTheTwoDispatchersDriveEachOther:
 
         sess._busy = True
         assert await tg._enqueue_with_receipt(
-            _UNIFIED, 70, "from telegram", origin=_tg_origin_for(7, 70)
+            _PIN, 70, "from telegram", origin=_tg_origin_for(7, 70)
         )
         assert await dc._enqueue_with_receipt(
-            _UNIFIED, "c1", "from discord", origin=_dc_origin_for("u1", "c1")
+            _PIN, "c1", "from discord", origin=_dc_origin_for("u1", "c1")
         )
         sess._busy = False
 
@@ -405,10 +407,10 @@ class TestTheTwoDispatchersDriveEachOther:
 
         sess._busy = True
         assert await dc._enqueue_with_receipt(
-            _UNIFIED, "c1", "from discord", origin=_dc_origin_for("u1", "c1")
+            _PIN, "c1", "from discord", origin=_dc_origin_for("u1", "c1")
         )
         assert await tg._enqueue_with_receipt(
-            _UNIFIED, 70, "from telegram", origin=_tg_origin_for(7, 70)
+            _PIN, 70, "from telegram", origin=_tg_origin_for(7, 70)
         )
         sess._busy = False
 
@@ -432,11 +434,9 @@ class TestTheTwoDispatchersDriveEachOther:
 
         sess._busy = True
         for i in range(3):
-            assert await tg._enqueue_with_receipt(
-                _UNIFIED, 70, f"tg{i}", origin=_tg_origin_for(7, 70)
-            )
+            assert await tg._enqueue_with_receipt(_PIN, 70, f"tg{i}", origin=_tg_origin_for(7, 70))
             assert await dc._enqueue_with_receipt(
-                _UNIFIED, "c1", f"dc{i}", origin=_dc_origin_for("u1", "c1")
+                _PIN, "c1", f"dc{i}", origin=_dc_origin_for("u1", "c1")
             )
         sess._busy = False
 
@@ -499,9 +499,9 @@ class TestTheTwoDispatchersDriveEachOther:
         dc.handle_message = _dc_handle
 
         sess._busy = True
-        assert await tg._enqueue_with_receipt(_UNIFIED, 70, "mine", origin=_tg_origin_for(7, 70))
+        assert await tg._enqueue_with_receipt(_PIN, 70, "mine", origin=_tg_origin_for(7, 70))
         assert await dc._enqueue_with_receipt(
-            _UNIFIED, "c1", "theirs", origin=_dc_origin_for("u1", "c1")
+            _PIN, "c1", "theirs", origin=_dc_origin_for("u1", "c1")
         )
         sess._busy = False
 
@@ -557,9 +557,9 @@ class TestTheTwoDispatchersDriveEachOther:
         register_drain("discord", _dc_drain)
 
         sess._busy = True
-        assert await tg._enqueue_with_receipt(_UNIFIED, 70, "mine", origin=_tg_origin_for(7, 70))
+        assert await tg._enqueue_with_receipt(_PIN, 70, "mine", origin=_tg_origin_for(7, 70))
         assert await dc._enqueue_with_receipt(
-            _UNIFIED, "c1", "theirs", origin=_dc_origin_for("u1", "c1")
+            _PIN, "c1", "theirs", origin=_dc_origin_for("u1", "c1")
         )
         sess._busy = False
 
@@ -582,9 +582,9 @@ class TestTheTwoDispatchersDriveEachOther:
         register_drain("discord", _explode)
 
         sess._busy = True
-        assert await tg._enqueue_with_receipt(_UNIFIED, 70, "mine", origin=_tg_origin_for(7, 70))
+        assert await tg._enqueue_with_receipt(_PIN, 70, "mine", origin=_tg_origin_for(7, 70))
         assert await dc._enqueue_with_receipt(
-            _UNIFIED, "c1", "theirs", origin=_dc_origin_for("u1", "c1")
+            _PIN, "c1", "theirs", origin=_dc_origin_for("u1", "c1")
         )
         sess._busy = False
 

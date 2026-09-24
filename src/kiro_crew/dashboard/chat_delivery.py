@@ -23,7 +23,11 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.dashboard.chat_utils import _redact_for_display, _redact_meta
-from kiro_crew.dashboard.slot_queue_repository import ATTACHMENT_META_KEYS, warn_if_not_durable
+from kiro_crew.dashboard.slot_queue_repository import (
+    ATTACHMENT_META_KEYS,
+    seal_key_of,
+    warn_if_not_durable,
+)
 from kiro_crew.history import HUMAN_TURN_META_KEY
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -989,7 +993,14 @@ def queue_for_next_turn(
     # past the count cap or the byte budget and the send is still accepted, so
     # that case is reported at WARNING rather than left silent. It is not a field
     # on this frame: a caller-visible flag was carried here and read by nothing.
-    warn_if_not_durable(slot._queue, qid, slot.key)
+    # Costed under the key the proofs were MINTED under (``seal_key_of``: the
+    # transcript's slot name, not ``slot.key`` -- a tab named "dashboard x" or a
+    # bound channel thread spells the two differently), so the record is billed
+    # WITH its seal, as the write bills it, and the warning names the key the
+    # seal, the generation record and the tombstone all use.
+    _proofs = getattr(slot, "_origin_proofs", None)
+    _generation = getattr(slot, "_queue_generation", "")
+    warn_if_not_durable(slot._queue, qid, seal_key_of(slot), _proofs, _generation)
     start_queue_persist(state, slot)
     return qid
 

@@ -131,6 +131,7 @@ from kiro_crew.dashboard.chat_utils import (
     _BLOCKED_SLASH_COMMANDS,
     _KIRO_ONLY_BLOCKED_SLASH_COMMANDS,
     _MAX_TOOL_PURPOSE,
+    CHANNEL_COMMAND_UNAVAILABLE,
     ResetCause,
     _append_compaction_notice,
     _apply_incognito_prefix,
@@ -151,12 +152,15 @@ from kiro_crew.dashboard.chat_utils import (
     build_recovery_requeue,
     chat_done_payload,
     chunk_generation,
+    dashboard_command_word,
+    displayable_channel_command,
     drained_to_thread,
     effective_session_key,
     expire_slack_options,
     is_harness_slash_command,
     is_system_injection_item,
     mirror_is_paused,
+    opens_with_quick_prompt,
     owned_stage_delivery_entry,
     parse_workflow_command,
     remember_slack_options,
@@ -164,6 +168,7 @@ from kiro_crew.dashboard.chat_utils import (
     run_to_completion,
     slack_mirror_is_paused,
     slot_history_key,
+    suppressed_channel_command,
     tighten_live_slot_memory_mode,
     tighten_replacement_to_restricted_original,
     user_text_span,
@@ -186,7 +191,15 @@ from kiro_crew.dashboard.session_directive_apply import (
     QUESTION_CARD_SHOWN_PREFIX,
     apply_session_directive,
 )
-from kiro_crew.dashboard.slot_queue_repository import RESTORED_QUEUE_KEY
+from kiro_crew.dashboard.slot_queue_repository import (
+    REJECTED_SEAL_CONSTRAINT,
+    RESTORED_QUEUE_KEY,
+    UNRECORDED_GENERATION_CONSTRAINT,
+    dashboard_origin_proven,
+    forget_provenance,
+    provenance_rejected,
+    provenance_unrecorded,
+)
 from kiro_crew.dashboard.state import (
     _MAX_SLOT_MESSAGES,
     CRON_NOTIFY_PREFIX,
@@ -355,7 +368,6 @@ from kiro_crew.providers.base import (
     LLMEvent,
     SessionMcpReport,
 )
-from kiro_crew.quick_prompts import QUICK_PROMPTS
 from kiro_crew.recovery.ladder import (
     L1_TOOL_CALL,
     SESSION_RECOVERY_MAX_ATTEMPTS,
@@ -4598,6 +4610,67 @@ def _authorize_recipient(
     return permitted
 
 
+def channel_egress_permitted(session_key: str, channel_type: str) -> bool:
+    """The channels-scope governance decision for one proactive egress, SEL-audited.
+
+    The governance half of :func:`_resolve_channel_target`, shared with the one
+    egress that ladder cannot serve: a notice to a linked Slack thread
+    (``session_control.notify_channel_recipient_dropped``), which Slack's dedicated
+    client posts. Every proactive send to a channel asks this first, so a session
+    whose profile denies the ``channels`` scope for that channel is never posted
+    into, whichever leg carries the text.
+
+    ``vet_and_audit`` == ``governance_permits`` + a SEL governance-decision record
+    for BOTH grant and denial. Every call here is a real send decision (the
+    read-only ``links[].live`` projection uses the in-memory
+    ``state._channel_link_is_live`` instead), so a governance decision at this
+    egress chokepoint MUST land in the SEL trail -- the security contract requires
+    every permission decision to be audited.
+
+    Fails closed: a degraded governance evaluation, a raising gate, or a decision
+    without ``permitted`` all deny. A ``PlatformCompositionError`` propagates,
+    because it means the governance ceiling itself is invalid and
+    ``governance_permits`` deliberately re-raises it rather than degrading;
+    swallowing it here would let a broken ceiling read as an ordinary skip.
+    """
+    try:
+        from kiro_crew.platform.context import PlatformCompositionError
+        from kiro_crew.platform.governance_profiles import vet_and_audit
+
+        decision = vet_and_audit(
+            "channels",
+            channel_type,
+            session_key=session_key,
+            tool_name="chat.channel_mirror",
+            # fail_closed=True: this is an EGRESS chokepoint on a network
+            # surface, so a degraded governance evaluation must DENY rather than
+            # degrade-to-permit. vet_and_audit forwards this to
+            # governance_permits, which swallows its own internal errors and
+            # returns a non-permissive Decision under fail_closed. Matches the
+            # other "channels"-scope gates: messaging/identity.py,
+            # slack/gateway.py, dashboard/handlers_system.py.
+            fail_closed=True,
+        )
+        # Default False, not True: a Decision without ``permitted`` is an
+        # unusable answer from a gate, and must not read as permission.
+        if not getattr(decision, "permitted", False):
+            logger.info(
+                "cross-surface: outbound to %s denied by governance policy; skipping",
+                channel_type,
+            )
+            return False
+    except PlatformCompositionError:
+        raise
+    except Exception:
+        logger.debug(
+            "cross-surface: governance check failed for %s; skipping (fail-closed)",
+            channel_type,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
 def _resolve_channel_target(
     state: Any,
     session_key: str,
@@ -4638,50 +4711,7 @@ def _resolve_channel_target(
     """
     if link is None or link.channel_type == SLACK_NAMESPACE or not link.channel_id:
         return None
-    try:
-        from kiro_crew.platform.context import PlatformCompositionError
-        from kiro_crew.platform.governance_profiles import vet_and_audit
-
-        # vet_and_audit == governance_permits + a SEL governance-decision record
-        # for BOTH grant and denial. Every call here is a real send/link
-        # decision (the read-only links[].live projection uses the in-memory
-        # state._channel_link_is_live instead), so a governance decision at this
-        # egress chokepoint MUST land in the SEL trail — the security contract
-        # requires every permission decision to be audited.
-        decision = vet_and_audit(
-            "channels",
-            link.channel_type,
-            session_key=session_key,
-            tool_name="chat.channel_mirror",
-            # fail_closed=True: this is an EGRESS chokepoint on a network
-            # surface, so a degraded governance evaluation must DENY rather than
-            # degrade-to-permit. vet_and_audit forwards this to
-            # governance_permits, which swallows its own internal errors and
-            # returns a non-permissive Decision under fail_closed. Matches the
-            # other "channels"-scope gates: messaging/identity.py,
-            # slack/gateway.py, dashboard/handlers_system.py.
-            fail_closed=True,
-        )
-        # Default False, not True: a Decision without ``permitted`` is an
-        # unusable answer from a gate, and must not read as permission.
-        if not getattr(decision, "permitted", False):
-            logger.info(
-                "cross-surface: outbound to %s denied by governance policy; " "skipping mirror",
-                link.channel_type,
-            )
-            return None
-    except PlatformCompositionError:
-        # A composition error means the governance ceiling itself is invalid.
-        # governance_permits deliberately re-raises it rather than degrading;
-        # swallowing it here would defeat that contract and let a broken
-        # ceiling read as an ordinary skip.
-        raise
-    except Exception:
-        logger.debug(
-            "cross-surface: governance check failed for %s; skipping mirror " "(fail-closed)",
-            link.channel_type,
-            exc_info=True,
-        )
+    if not channel_egress_permitted(session_key, link.channel_type):
         return None
     transport = state.get_channel_transport(link.channel_type)
     if transport is None or not transport.capabilities.supports_proactive_send:
@@ -4922,6 +4952,30 @@ def cross_surface_withheld(state: Any, slot: Any) -> bool:
     return any(newly_held_constraints(now, admission) for admission in fences.values())
 
 
+async def _publish_cross_surface_reply(state: Any, slot: Any, session_key: str, text: str) -> bool:
+    """The fenced channel-neutral publication: ask the steer-audience fence, then
+    deliver through :func:`_deliver_cross_surface_reply`.
+
+    Every text a turn in THIS module publishes to a linked non-Slack channel goes
+    through here -- the completed reply and the linked-conversation command
+    refusal -- so the fence (:func:`cross_surface_withheld`) is consulted at one
+    site and a new publisher in this module cannot be added without inheriting it
+    (``test_session_control`` pins the callers). The plan-halt notice in
+    ``chat_orchestrator`` calls the transport leg directly and predates the fence.
+    Withheld means the transcript keeps the text and the channel gets nothing, the
+    same outcome the reply leg has always had. Returns whether it published.
+    """
+    if cross_surface_withheld(state, slot):
+        logger.info(
+            "withholding cross-surface reply for %s: %d unresolved steer audience fence(s)",
+            session_key,
+            len(slot._steer_audience_fences),
+        )
+        return False
+    await _deliver_cross_surface_reply(state, session_key, text)
+    return True
+
+
 async def _deliver_cross_surface_reply(state: Any, session_key: str, assistant_text: str) -> None:
     """Deliver a completed dashboard reply to a linked NON-Slack channel.
 
@@ -4935,7 +4989,8 @@ async def _deliver_cross_surface_reply(state: Any, session_key: str, assistant_t
     push is per-TARGET rather than blanket answers that in ``send_message`` itself
     — WeCom pushes through ``aibot_send_msg`` but only into a conversation the user
     has already written to. Best-effort: a delivery failure never disrupts the
-    dashboard turn.
+    dashboard turn. Callers publish through :func:`_publish_cross_surface_reply`,
+    which owns the fence; this function is the transport leg only.
     """
     if not assistant_text:
         return
@@ -8728,6 +8783,34 @@ def _drop_stale_admissions(state: DashboardState, slot: _ChatSlot) -> None:
             q.get("meta"),
             directive_user_origin=q.get("_directive_user_origin") is True,
         )
+        # A message handed off from a channel conversation bound to this session
+        # (``channel_handoff``, the Slack intercept) rides on that binding: it is
+        # the entry's reply route and the reason it was accepted. The binding is
+        # the slot's mirror link, so a mirror that is GONE at the drain -- the
+        # conversation `/unlink`ed or rotated away while the entry waited -- must
+        # drop the entry rather than answer it into a session the user left.
+        # Asked of the entry's OWN room against the rooms held now, not of whether
+        # any mirror survives: a session can hold two (a Telegram mirror beside a
+        # Slack thread), and the sender's room leaving while the other stays is a
+        # narrowing to ``newly_held_constraints`` but the lost reply route to this
+        # entry. Not a constraint for any other entry: composer text loses nothing
+        # when a mirror disappears.
+        if _sc.channel_recipient_released(now, q.get("meta")):
+            changed.append(_sc.CHANNEL_UNLINKED_CONSTRAINT)
+        # A restored entry whose durable record carried a seal this gateway could
+        # not verify (``restore_queue_provenance``): rewritten under its seal, a
+        # seal moved from another record, a record kept from a superseded write.
+        # Provenance that is present and false is dropped whatever holds now, with
+        # the dashboard notice -- its stamps are stripped and name nobody. A
+        # restored entry from a line whose write the fenced store holds NO record
+        # of for this transcript (a save cut short, a transcript put back from a
+        # copy, a reused slot key) is dropped the same way, under its own notice:
+        # nothing on it was altered, so the tamper wording would be a false claim.
+        if q.get(RESTORED_QUEUE_KEY) is True:
+            if provenance_rejected(slot, q):
+                changed.append(REJECTED_SEAL_CONSTRAINT)
+            elif provenance_unrecorded(slot, q):
+                changed.append(UNRECORDED_GENERATION_CONSTRAINT)
         if changed:
             doomed.append((q, changed))
     for q, changed in doomed:
@@ -8872,6 +8955,9 @@ async def _start_next_queued_turn(
     ``required_queue_id`` binds the action to the selected card after admission
     revalidation, so a stale click never starts a different queued message.
     """
+    # circular import: session_control imports this package's modules at module level.
+    from kiro_crew.dashboard.session_control import CHANNEL_RECIPIENT_META_KEY
+    from kiro_crew.dashboard.session_control import channel_recipient_of as _sc_channel_recipient_of
 
     # FIRST, before anything reads the queue: re-assert each entry's
     # admission-time containment and drop every entry that has stopped
@@ -9262,13 +9348,22 @@ async def _start_next_queued_turn(
             return False
 
     try:
-        merge = KiroCrewConfig.load().dashboard.merge_queued_messages
+        _cfg = KiroCrewConfig.load()
+        merge = _cfg.dashboard.merge_queued_messages
+        # The harness axis the turn's channel-command refusal is asked with; the
+        # merge asks the same question of each entry so a refusable channel command
+        # is never buried behind the merge banner (``refuses_as_channel_command``).
+        # Both provider seams that reach the claude harness count, as at the refusal.
+        _merge_cc_provider = is_claude_code(_cfg.agent.provider) or is_claude_backend_name(
+            getattr(_cfg.agent, "acp_backend", "")
+        )
     except Exception:
         logger.warning(
             "Failed to load config; falling back to sequential dequeue",
             exc_info=True,
         )
         merge = False
+        _merge_cc_provider = False
 
     in_stage = bool(slot._in_stage_execution)
     hold_users = bool(
@@ -9310,7 +9405,7 @@ async def _start_next_queued_turn(
         # prompts in the same turn and falsely acknowledge work the user did not
         # choose.
         next_msg, consumed = _dequeue_next_message(
-            slot, merge_enabled=merge and not required_queue_id
+            slot, merge_enabled=merge and not required_queue_id, cc_provider=_merge_cc_provider
         )
     if next_msg is None:
         return False
@@ -9346,12 +9441,62 @@ async def _start_next_queued_turn(
     directive_user_origin = bool(consumed) and all(
         item.get("_directive_user_origin") is True for item in consumed
     )
-    # Channel authority is the narrower credential boundary. If batching combines
-    # channel and dashboard entries, the whole turn must retain that boundary so a
-    # directive derived from either message cannot inherit dashboard-owner secrets.
+    # Channel authority is the narrower credential boundary. The merge folds only
+    # entries of one origin (``chat_utils.merge_origin``), so a consumed run is
+    # never channel and dashboard text together; the ``any`` reduction below is
+    # the fail-closed reading kept for the day a run is -- a directive derived from
+    # either message must never inherit dashboard-owner secrets.
+    # A RESTORED entry has no flags and gets that narrower authority by DEFAULT:
+    # its line is an ordinary writable file, so nothing on it can be trusted to
+    # grant the composer's command word except the proof the gateway itself
+    # stamped at enqueue and can verify now (``slot_queue_repository.
+    # dashboard_origin_proven``, read from the slot's sidecar). A dashboard entry
+    # keeps its command word through a restart because its address-less proof
+    # still verifies; a channel hand-off's proof is over the conversation it came
+    # from and never verifies as address-less; a line from before records carried
+    # a seal proves nothing and its entries get the narrower authority; and no edit
+    # to the file can produce a proof of either kind.
     directive_channel_origin = bool(consumed) and any(
-        item.get("_directive_channel_origin") is True for item in consumed
+        item.get("_directive_channel_origin") is True
+        or (item.get(RESTORED_QUEUE_KEY) is True and not dashboard_origin_proven(slot, item))
+        for item in consumed
     )
+    # The refusal of a command word (``suppressed_channel_command`` in the turn)
+    # is a different question from the boundary above: it names the author --
+    # "not available from a linked conversation" -- so it is owed to a channel
+    # conversation's own words and nothing else, and those are the entries that
+    # carry a conversation's address (``session_control.channel_recipient_of``:
+    # stamped by the hand-off, or put back by the gateway's seal at the restore).
+    # A restored entry with no verifiable provenance is not thereby a channel
+    # message, and neither is channel text the gateway could not place: both keep
+    # the narrower authority above and reach the model as prose, and nobody is
+    # told about a conversation the words never came from.
+    channel_message = any(
+        _sc_channel_recipient_of(item.get("meta")) is not None for item in consumed
+    )
+    # The stamp itself travels to the turn beside that answer, for the one reader
+    # that needs more than the boolean: the refusal notice's Slack leg re-decides
+    # the stamped PRINCIPAL against the live roster before posting into the
+    # thread (``_run_chat``, ``_channel_recipient``). The persisted row loses the
+    # stamp below (plumbing, not row meta), so this is the only way it reaches the
+    # turn. One stamp per run: the merge folds only entries of one recipient
+    # (``chat_utils.merge_origin``), so a run naming two is a shape the drain does
+    # not vouch for and hands over none -- the notice then posts nowhere on Slack.
+    _recipient_stamps = [
+        dict(item["meta"][CHANNEL_RECIPIENT_META_KEY])
+        for item in consumed
+        if _sc_channel_recipient_of(item.get("meta")) is not None
+    ]
+    channel_recipient: dict[str, Any] | None = (
+        _recipient_stamps[0]
+        if _recipient_stamps and all(s == _recipient_stamps[0] for s in _recipient_stamps)
+        else None
+    )
+    # Both flags above are the last readers of a consumed entry's provenance; the
+    # bounded store (``slot_queue_repository.MAX_ORIGIN_PROOFS``) is pruned on
+    # drain, here, rather than at the next stamp.
+    for item in consumed:
+        forget_provenance(slot, item.get("id"))
     if slot._stopping and not is_system_injection:
         slot.append(
             "error",
@@ -9514,9 +9659,18 @@ async def _start_next_queued_turn(
                 _drained_send_ids.append(_sid)
             # The admission-time containment snapshot is queue plumbing,
             # consumed by _drop_stale_admissions above; it says nothing about the
-            # ROW, so it must not ride into the persisted transcript meta.
+            # ROW, so it must not ride into the persisted transcript meta. The
+            # channel recipient stamp (``CHANNEL_RECIPIENT_META_KEY``) is plumbing
+            # of the same kind, for the same sweep and the drain's own provenance
+            # reduction: it names a write target for the drop notice, not anything
+            # about the row. The gateway's provenance proof never sits on the
+            # entry at all (``slot_queue_repository.ORIGIN_PROOF_KEY`` is the
+            # durable record's field, read from the slot's sidecar), so there is
+            # nothing of it to strip here.
             _drained_meta.update(
-                (k, v) for k, v in _item_meta.items() if k != QUEUED_CONTAINMENT_META_KEY
+                (k, v)
+                for k, v in _item_meta.items()
+                if k not in (QUEUED_CONTAINMENT_META_KEY, CHANNEL_RECIPIENT_META_KEY)
             )
     if _drained_ids:
         _drained_meta.pop("steer_delivery_id", None)
@@ -9634,6 +9788,8 @@ async def _start_next_queued_turn(
         "_synthetic_payload": synthetic_payload,
         "_directive_user_origin": directive_user_origin,
         "_directive_channel_origin": directive_channel_origin,
+        "_channel_message": channel_message,
+        "_channel_recipient": channel_recipient,
     }
     # Provenance for the session's log, from the enqueue-time ``kind`` tag — the
     # same unforgeable source ``is_system_injection_item`` classifies on, and for
@@ -10308,6 +10464,28 @@ async def _run_chat(
     # message-value key could not tell apart). Captured by the fire path.
     _directive_loop_gen: int = 0,
     _directive_channel_origin: bool = False,
+    # Whether this turn's text is a channel conversation's OWN words -- the one
+    # thing the channel-command refusal below may say about it. The queue drain
+    # answers it from the address on the consumed entry (``session_control.
+    # channel_recipient_of``), so a restored entry with no verifiable
+    # provenance, or channel text the gateway could not place, keeps the narrower
+    # authority of ``_directive_channel_origin`` without being named a channel
+    # message: its command word reaches the model as prose and nobody is told
+    # about a conversation it never came from. ``None`` is a caller that runs a
+    # conversation's text directly (the Slack thread intercept) and answers the
+    # question itself, beside the authority flag: that text is the conversation's
+    # own words.
+    _channel_message: bool | None = None,
+    # The stamp of the channel conversation those words came from
+    # (``session_control.channel_recipient_meta``'s inner dict: channel type,
+    # conversation id, admitted principal, thread), handed over by the drain from
+    # the consumed entry -- which strips it from the persisted row -- and by the
+    # Slack intercept for the thread it runs directly. Read by one site: the
+    # channel-command refusal's Slack leg, which re-decides the stamped principal
+    # against the live roster before posting into the thread, as the drop notice
+    # does. ``None`` is a turn with no conversation to re-decide for, and that leg
+    # then posts nowhere.
+    _channel_recipient: dict[str, Any] | None = None,
     # Who caused this turn, from the dispatch that knows -- a consumed queue
     # entry's enqueue-time ``kind`` tag, or an injector calling this runner
     # directly. Recorded in the session's log, so it must not be derivable from
@@ -11546,7 +11724,9 @@ async def _run_chat(
     _is_synthetic = _synthetic_payload or message.startswith(SUBAGENT_SYNTHESIS_PREFIX)
 
     # ── Slash commands: detect early, before session acquisition ──
-    first_word = message.split()[0] if message.strip() else ""
+    # Empty for a CHANNEL-origin turn: that text is prose here, never a dashboard
+    # or harness command (see ``dashboard_command_word``).
+    first_word = dashboard_command_word(message, channel_origin=_directive_channel_origin)
     _cfg_agent = KiroCrewConfig.load().agent
     _is_cc_provider = is_claude_code(_cfg_agent.provider)
     # The claude harness answers on either provider axis: the claude_code seam, or
@@ -11559,6 +11739,142 @@ async def _run_chat(
     # must NOT be forwarded to the harness as a command.
     is_slash = is_harness_slash_command(first_word, cc_provider=_is_cc_provider)
     _this_turn_is_clear = is_slash and first_word.lower() == "/clear"
+
+    # A channel-origin turn whose leading token the dashboard WOULD have run as a
+    # command is refused and its author told, not streamed to the model as prose:
+    # the person in the linked conversation typed a command and would otherwise
+    # wait for an outcome (a compaction, a workflow) that never comes. A quick
+    # prompt is not one of these -- it is a prose shortcut every surface expands
+    # -- and stays a turn. Same shape as the blocked-command refusal below; the
+    # notice also travels to the conversation that typed it, since that user does
+    # not read this transcript. Owed only to a conversation's own words
+    # (``_channel_message``): text that merely holds channel AUTHORITY -- a
+    # restored entry the gateway could not vouch for -- has lost its command word
+    # above and is prose here, with no conversation to tell. Asked on the HARNESS
+    # axis (``_is_cc_harness``), not the provider seam alone: the acp seam spawning
+    # the claude backend answers a leading slash as that harness's command too, so
+    # a linked ``/review`` there must be refused, not streamed as prose.
+    _channel_command = suppressed_channel_command(
+        message,
+        channel_origin=(
+            _directive_channel_origin if _channel_message is None else _channel_message
+        ),
+        cc_provider=_is_cc_harness,
+    )
+    if _channel_command:
+        # Named, not repeated: under ``claude_code`` the token is the channel
+        # user's own text, and every surface below is one the intercept already
+        # redacts their message for (``displayable_channel_command``).
+        _shown_command = displayable_channel_command(_channel_command)
+        sel().log_tool_invocation(
+            session_key=session_key,
+            agent=slot.agent or "kirocrew",
+            source="dashboard",
+            tool_name=_shown_command,
+            tool_kind="slash_command",
+            outcome="blocked",
+            metadata={"slot": slot.key, "reason": "channel_origin"},
+        )
+        _channel_notice = CHANNEL_COMMAND_UNAVAILABLE.format(command=_shown_command)
+        slot.append("assistant", _channel_notice, "msg msg-a")
+        state.push_slots_update()
+        # A proactive send to a channel, so it asks the channels-scope governance
+        # gate first, like the ladder leg below and the drop notice's Slack leg:
+        # the command was queued while the scope may have been permitted and is
+        # refused now, and a denial landing in between must hold at this egress.
+        # Off the loop (the gate reads the governance profile), fail closed.
+        try:
+            _slack_permitted = await asyncio.to_thread(
+                channel_egress_permitted, session_key, SLACK_NAMESPACE
+            )
+        except Exception:
+            logger.warning(
+                "channel command refusal: governance gate raised for %s; withholding the "
+                "Slack notice",
+                session_key,
+                exc_info=True,
+            )
+            _slack_permitted = False
+        # Then the RECIPIENT re-decision the drop notice's Slack leg takes at the
+        # same client (``session_control.slack_recipient_still_allowed``, one
+        # spelling): governance answered whether this session may use Slack at
+        # all; this answers whether the person whose words are being refused is
+        # still allowed to be posted to, read off the stamp the dispatch handed
+        # this turn (``_channel_recipient``). The command was queued while they
+        # were; a revocation landing while it waited must hold at this egress as
+        # it holds for the drop notice, and the denial lands in the SEL trail.
+        # Fails closed: a turn handed no Slack stamp -- words the gateway could
+        # not place with a Slack conversation, or a run naming two -- has nobody
+        # identifiable to post to, and a raising check authorizes nobody. Off the
+        # loop for the SEL row, like the governance gate above.
+        _slack_recipient_permitted = False
+        if _slack_permitted:
+            # circular import: session_control imports this module at module level.
+            from kiro_crew.dashboard import session_control as _sc
+            from kiro_crew.dashboard.session_control import CHANNEL_RECIPIENT_META_KEY
+
+            _recipient_meta = {CHANNEL_RECIPIENT_META_KEY: _channel_recipient}
+            _recipient = _sc.channel_recipient_of(_recipient_meta)
+            _recipient_link = _sc.channel_recipient_link(_recipient_meta)
+            if (
+                _recipient is not None
+                and _recipient_link is not None
+                and _recipient[0] == SLACK_NAMESPACE
+            ):
+                try:
+                    _slack_recipient_permitted = await asyncio.to_thread(
+                        _sc.slack_recipient_still_allowed,
+                        _recipient_link,
+                        _recipient[2],
+                        session_key=session_key,
+                    )
+                except Exception:
+                    logger.warning(
+                        "channel command refusal: slack recipient check raised for %s; "
+                        "withholding the Slack notice",
+                        session_key,
+                        exc_info=True,
+                    )
+                    _slack_recipient_permitted = False
+                if not _slack_recipient_permitted:
+                    logger.warning(
+                        "channel command refusal: the stamped Slack principal is no longer "
+                        "allowed for %s; withholding the Slack notice",
+                        session_key,
+                    )
+            else:
+                logger.info(
+                    "channel command refusal: no Slack conversation stamped on this turn for "
+                    "%s; the Slack notice posts nowhere",
+                    session_key,
+                )
+        # Then the steer-audience fence, asked synchronously with the send like
+        # the turn's own Slack reply (``cross_surface_withheld``): a peer steer
+        # admitted under another containment withholds this notice from the thread
+        # as it withholds the reply.
+        if _slack_recipient_permitted and not cross_surface_withheld(state, slot):
+            await _deliver_linked_slack_message(state, slot, sessions, session_key, _channel_notice)
+        elif _slack_recipient_permitted and getattr(state, "slack_client", None) is not None:
+            # Withheld from the cached thread: say so once, as the reply site does;
+            # the transcript keeps the notice.
+            logger.info(
+                "withholding the Slack command-refusal notice for %s: %d unresolved steer "
+                "audience fence(s)",
+                session_key,
+                len(slot._steer_audience_fences),
+            )
+        # Same fenced publication site as the turn's own reply: a peer steer admitted
+        # under another containment withholds this notice from the channel too.
+        await _publish_cross_surface_reply(state, slot, session_key, _channel_notice)
+        # Leave through the queue-cycle hand-off the turn's tail uses, not a bare
+        # return: a channel hand-off is QUEUED by design, so this refusal is reached
+        # from the drain with entries possibly behind it, and a return here would
+        # strand them until an unrelated message drained the slot -- a later message
+        # could then run ahead of them. The successor starts, or the cycle ends with
+        # its terminal ``done``.
+        if not (slot._queue and await _start_next_queued_turn(state, slot)):
+            await _finish_queue_cycle(state, slot)
+        return
 
     # Block dangerous/local-only commands before acquiring a session. The
     # kiro-only members are skipped where the harness implements them itself.
@@ -12772,7 +13088,14 @@ async def _run_chat(
         # after post-assembly prefixes). It must NOT also shorten the span handed to
         # build_message -- that span is how the matcher FINDS the token, and zeroing
         # it stops the expansion entirely. `user_text_span` keeps the two apart.
-        _is_quick_prompt = first_word.lower() in QUICK_PROMPTS
+        # Classified from the token AS TYPED (``opens_with_quick_prompt``), not from
+        # `first_word`: a channel-origin turn has no command word, but its macro is
+        # still the one `build_message` expands for every surface, so it is a
+        # replacing expansion here too -- and the `$skill` gate below must see it
+        # as one, or a linked conversation's `/plain ... $skill` loads skill bodies
+        # the composer's own path refuses to. Only command DISPATCH keys on the
+        # blanked word.
+        _is_quick_prompt = opens_with_quick_prompt(message)
         prompt_expanded = _is_quick_prompt
         if message.startswith("@") and not is_slash and _prompt_depth < 1:
             original = message
@@ -19365,17 +19688,10 @@ async def _run_chat(
         # withheld: it has no mirrored question, whereas every requeue site runs
         # downstream of the user-message leg above, so a recovery reply always has
         # a preceding question on the linked surface — withholding it would strand
-        # that question unanswered.
+        # that question unanswered. The steer-audience fence is asked inside
+        # ``_publish_cross_surface_reply``, the one publication site.
         if not is_slash:
-            if cross_surface_withheld(state, slot):
-                logger.info(
-                    "withholding cross-surface reply for %s: %d unresolved steer "
-                    "audience fence(s)",
-                    session_key,
-                    len(slot._steer_audience_fences),
-                )
-            else:
-                await _deliver_cross_surface_reply(state, session_key, assistant_text)
+            await _publish_cross_surface_reply(state, slot, session_key, assistant_text)
     except asyncio.CancelledError:
         _crew_log_error = "CancelledError"
         _persist_partial_reply()
@@ -21033,6 +21349,8 @@ async def _run_chat(
                 except Exception:
                     logger.debug("Task append cleanup failed", exc_info=True)
                 try:
+                    # Not gated: ending the stream publishes no turn content, it
+                    # ends the streaming state of a message already in the thread.
                     await state.slack_client.stop_stream(_mirror_chan, _mirror_stream_ts)
                 except Exception:
                     logger.debug("Stream cleanup failed", exc_info=True)

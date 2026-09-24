@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import contextlib
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
+from kiro_crew.messaging.session_resume import ResumeBinding, RoutingDecision
 from kiro_crew.teams.client import TeamsInbound
 from kiro_crew.teams.commands import COMMAND_SPEC, build_help_text, parse_command
 from kiro_crew.teams.transport_dispatch import (
@@ -226,8 +228,12 @@ class TestQueueReceipt:
         d = _dispatcher(sessions, client)
         inbound = _inbound("first")
 
-        await d._enqueue_with_receipt(d._session_key(_EMAIL), inbound, "first")
-        await d._enqueue_with_receipt(d._session_key(_EMAIL), inbound, "second")
+        await d._enqueue_with_receipt(
+            ResumeBinding(resumed_key=None).at(d._session_key(_EMAIL)), inbound, "first"
+        )
+        await d._enqueue_with_receipt(
+            ResumeBinding(resumed_key=None).at(d._session_key(_EMAIL)), inbound, "second"
+        )
 
         assert len(client.sent) == 1, "the receipt is created once"
         assert client.updates, "and then EDITED in place as the burst grows"
@@ -240,7 +246,9 @@ class TestQueueReceipt:
         client = _Client()
         d = _dispatcher(sessions, client)
         inbound = _inbound("held")
-        await d._enqueue_with_receipt(d._session_key(_EMAIL), inbound, "held")
+        await d._enqueue_with_receipt(
+            ResumeBinding(resumed_key=None).at(d._session_key(_EMAIL)), inbound, "held"
+        )
 
         await d._handle_stop(inbound)
 
@@ -395,8 +403,10 @@ class TestDrainIdentity:
         first = self._from("first@example.com", "CONV-FIRST", "act-first")
         second = self._from("second@example.com", "CONV-SECOND", "act-second")
 
-        assert await d._enqueue_with_receipt(key, first, "mine")
-        assert await d._enqueue_with_receipt(key, second, "and mine")
+        assert await d._enqueue_with_receipt(ResumeBinding(resumed_key=None).at(key), first, "mine")
+        assert await d._enqueue_with_receipt(
+            ResumeBinding(resumed_key=None).at(key), second, "and mine"
+        )
         # The turn they queued behind has now finished. The fake exposes no setter,
         # and the drain only runs once the semaphore is released.
         sessions._busy = False
@@ -439,8 +449,12 @@ class TestDrainIdentity:
         second = self._from(_EMAIL, "CONV", "act-2")
         assert first.activity_id != second.activity_id, "the point of this test"
 
-        assert await d._enqueue_with_receipt(key, first, "first")
-        assert await d._enqueue_with_receipt(key, second, "second")
+        assert await d._enqueue_with_receipt(
+            ResumeBinding(resumed_key=None).at(key), first, "first"
+        )
+        assert await d._enqueue_with_receipt(
+            ResumeBinding(resumed_key=None).at(key), second, "second"
+        )
         sessions._busy = False
 
         await d._drain_queue(key, first)
@@ -523,7 +537,9 @@ class TestDrainIdentity:
         key = d._session_key(_EMAIL)
         queuer = self._from("queuer@example.com", "CONV-QUEUER", "act-q")
 
-        assert await d._enqueue_with_receipt(key, queuer, "held")
+        assert await d._enqueue_with_receipt(
+            ResumeBinding(resumed_key=None).at(key), queuer, "held"
+        )
         sessions._busy = False
 
         await d._drain_queue(key, self._from(_EMAIL, "CONV-OPENER", "act-o"))
@@ -540,7 +556,9 @@ class TestDrainIdentity:
         key = d._session_key(_EMAIL)
         sender = self._from("who@example.com", "CONV-WHO", "act-w")
 
-        assert await d._enqueue_with_receipt(key, sender, "hello")
+        assert await d._enqueue_with_receipt(
+            ResumeBinding(resumed_key=None).at(key), sender, "hello"
+        )
 
         # Read back through the production reader rather than by spelling the
         # storage keys, so renaming one cannot leave this test passing.
@@ -600,7 +618,7 @@ class TestTeamsSharesTheQueueWithOtherTransports:
         key = d._session_key(_EMAIL)
         mine = self._from(_EMAIL, "CONV", "act-1")
 
-        assert await d._enqueue_with_receipt(key, mine, "mine")
+        assert await d._enqueue_with_receipt(ResumeBinding(resumed_key=None).at(key), mine, "mine")
         # Theirs arrives FIRST in the queue, which is the ordering the old read died on.
         sessions.queues[key].insert(0, self._foreign())
         sessions._busy = False
@@ -630,7 +648,9 @@ class TestTeamsSharesTheQueueWithOtherTransports:
         key = d._session_key(_EMAIL)
         mine = self._from("solo@example.com", "CONV-SOLO", "act-solo")
 
-        assert await d._enqueue_with_receipt(key, mine, "answer me")
+        assert await d._enqueue_with_receipt(
+            ResumeBinding(resumed_key=None).at(key), mine, "answer me"
+        )
         sessions._busy = False
 
         assert queue_drain._DRAINS.get("teams") is not None, "a peer must be able to wake it"
@@ -662,7 +682,9 @@ class TestTeamsSharesTheQueueWithOtherTransports:
 
         queue_drain.register_drain("telegram", _peer)
 
-        assert await d._enqueue_with_receipt(key, self._from(_EMAIL, "CONV", "act-1"), "mine")
+        assert await d._enqueue_with_receipt(
+            ResumeBinding(resumed_key=None).at(key), self._from(_EMAIL, "CONV", "act-1"), "mine"
+        )
         sessions.queues[key].append(self._foreign())
         sessions._busy = False
 
@@ -691,7 +713,7 @@ class TestTeamsSharesTheQueueWithOtherTransports:
 
         monkeypatch.setattr(d._queue, "flip_answering_locked", _flip)
 
-        assert await d._enqueue_with_receipt(key, mine, "mine")
+        assert await d._enqueue_with_receipt(ResumeBinding(resumed_key=None).at(key), mine, "mine")
         sessions.queues[key].append(self._foreign())
         sessions._busy = False
 
@@ -720,7 +742,7 @@ class TestTeamsSharesTheQueueWithOtherTransports:
 
         monkeypatch.setattr(d._queue, "flip_answering_locked", _flip)
 
-        assert await d._enqueue_with_receipt(key, mine, "mine")
+        assert await d._enqueue_with_receipt(ResumeBinding(resumed_key=None).at(key), mine, "mine")
         sessions.queues[key].append(("t1", "theirs", _origin_kwargs(theirs)))
         sessions._busy = False
 
@@ -746,3 +768,180 @@ class _AddressedClient(_Client):
 
 async def _true() -> bool:
     return True
+
+
+class TestABusyResumedSession:
+    """A message into a resumed dashboard session that is mid-turn goes to the
+    dashboard slot's own machinery (``dashboard.channel_handoff``), never to this
+    channel's queue; the slot's refusals are worded here; and a gateway command never
+    waits at all."""
+
+    def _resumed(self, d: TeamsDispatcher) -> None:
+        d._session_resume.route = AsyncMock(  # type: ignore[method-assign]
+            return_value=RoutingDecision(resumed_key="dashboard:chat-1")
+        )
+
+    @staticmethod
+    def _hand_off(monkeypatch, outcome, handed: list | None = None) -> None:
+        """Stand in for the shared hand-off, recording what the dispatcher passed."""
+        from kiro_crew.dashboard import channel_handoff
+
+        async def _hand(state, session_key, text, *, mode, has_attachments, **recipient):
+            if handed is not None:
+                handed.append((session_key, text, mode, has_attachments, recipient))
+            return outcome
+
+        monkeypatch.setattr(channel_handoff, "hand_to_resumed_slot", _hand)
+
+    @pytest.mark.asyncio
+    async def test_the_message_never_waits_in_this_channels_queue(self) -> None:
+        """No dashboard slot can take it (no dashboard attached here), so the slot
+        path refuses with the resumed-busy wording -- and nothing is queued on the
+        resumed key: this channel's queue drains only from the tail of a Teams turn,
+        so an entry there would run later in the wrong session."""
+        sessions = _Sessions(_Provider())
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        self._resumed(d)
+
+        await d.handle_message(_inbound("and the weather?"))
+
+        assert sessions.queues == {}
+        assert any("busy with a turn started elsewhere" in body for _, body, _ in client.sent)
+
+    @pytest.mark.asyncio
+    async def test_a_false_enqueue_retry_stays_on_the_pinned_session(self) -> None:
+        """Admitted natively; during the awaited steer the conversation binds to a
+        dashboard session and the native turn ends, so the enqueue finds no turn and
+        the message is retried as a fresh turn. The retry must not route again -- that
+        is how it lands, and persists, in the session the binding now names -- it
+        carries the pin it was admitted with and runs there."""
+        provider = _Provider()
+        sessions = _Sessions(provider)
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        binding: list[str | None] = [None]
+        d._session_resume.route = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda conversation_id: RoutingDecision(resumed_key=binding[0])
+        )
+        d._session_resume.resumed_session = lambda conversation_id: binding[0]  # type: ignore[method-assign]
+
+        async def _steer(text: str) -> bool:
+            binding[0] = "dashboard:chat-B"  # `/sessions` landed mid-await
+            sessions._busy = False  # and the native turn ended, so the enqueue finds no turn
+            return False
+
+        provider.steer = _steer  # type: ignore[method-assign]
+        ran: list[str] = []
+        d._run_turn = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda *a, **kw: ran.append(
+                kw["binding"].resumed_key if "binding" in kw else kw.get("resumed_key") or ""
+            )
+        )
+
+        await d.handle_message(_inbound("and the weather?"))
+
+        assert ran != ["dashboard:chat-B"], "the retry re-routed into the new session"
+        assert ran == [None], "the retry did not run where it was pinned"
+        assert d._session_resume.route.await_count == 1, "the retry routed again"
+        assert not any(
+            "Dropped a queued message" in body for _, body, _ in client.sent
+        ), "a live message was dropped"
+
+    @pytest.mark.asyncio
+    async def test_a_running_dashboard_turn_takes_the_message_instead(self, monkeypatch) -> None:
+        """When the DASHBOARD holds the resumed session's turn the message goes to the
+        slot's own steer or queue path, with the conversation and the admitted sender
+        riding along for the drop notice; this channel's queue stays empty."""
+        from kiro_crew.dashboard.channel_handoff import HANDOFF_QUEUED, ResumedBusyOutcome
+
+        sessions = _Sessions(_Provider())
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        self._resumed(d)
+        handed: list = []
+        self._hand_off(monkeypatch, ResumedBusyOutcome(HANDOFF_QUEUED), handed)
+
+        await d.handle_message(_inbound("and the weather?"))
+
+        assert handed == [
+            (
+                "dashboard:chat-1",
+                "and the weather?",
+                "steer",
+                False,
+                {"channel_type": "teams", "conversation_id": "CONV", "principal": _EMAIL},
+            )
+        ]
+        assert sessions.queues == {}
+        assert any("Queued for that session" in body for _, body, _ in client.sent)
+
+    @pytest.mark.asyncio
+    async def test_a_steered_message_is_confirmed_as_steered(self, monkeypatch) -> None:
+        from kiro_crew.dashboard.channel_handoff import HANDOFF_STEERED, ResumedBusyOutcome
+
+        sessions = _Sessions(_Provider())
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        self._resumed(d)
+        self._hand_off(monkeypatch, ResumedBusyOutcome(HANDOFF_STEERED))
+
+        await d.handle_message(_inbound("and the weather?"))
+
+        assert sessions.queues == {}
+        assert any("Steering that session" in body for _, body, _ in client.sent)
+
+    @pytest.mark.asyncio
+    async def test_a_full_dashboard_queue_is_refused_while_the_dashboard_drives(
+        self, monkeypatch
+    ) -> None:
+        from kiro_crew.dashboard.channel_handoff import REFUSED_QUEUE_FULL, _refused
+
+        sessions = _Sessions(_Provider())
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        self._resumed(d)
+        self._hand_off(monkeypatch, _refused(REFUSED_QUEUE_FULL))
+
+        await d.handle_message(_inbound("one too many"))
+
+        assert sessions.queues == {}
+        assert any("queue is full" in body for _, body, _ in client.sent)
+
+    @pytest.mark.asyncio
+    async def test_attachments_are_refused_while_the_dashboard_drives(self, monkeypatch) -> None:
+        from kiro_crew.dashboard.channel_handoff import REFUSED_ATTACHMENTS, _refused
+
+        sessions = _Sessions(_Provider())
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        self._resumed(d)
+        self._hand_off(monkeypatch, _refused(REFUSED_ATTACHMENTS))
+
+        await d.handle_message(_inbound("see attached"))
+
+        assert sessions.queues == {}
+        assert any("attachments" in body for _, body, _ in client.sent)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("command", ["/sessions other issue", "/new", "/stop", "/help"])
+    async def test_a_command_typed_while_the_resumed_turn_is_busy_is_executed(
+        self, command: str
+    ) -> None:
+        """The gateway runs the command; the busy turn never sees it as a queue
+        entry or a steer."""
+        sessions = _Sessions(_Provider())
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        self._resumed(d)
+        d._session_resume.show_picker = AsyncMock()  # type: ignore[method-assign]
+        d._session_resume.leave_resumed_session = AsyncMock(  # type: ignore[method-assign]
+            return_value="dashboard:chat-1"
+        )
+
+        await d.handle_message(_inbound(command))
+
+        if command.startswith("/sessions"):
+            d._session_resume.show_picker.assert_awaited_once()
+            assert d._session_resume.show_picker.await_args.args[-1] == "other issue"
+        assert sessions.queues == {}

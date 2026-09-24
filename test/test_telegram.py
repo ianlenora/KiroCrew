@@ -46,7 +46,7 @@ from kiro_crew.messaging.renderer import (
     OutputEvent,
     session_provenance_tag,
 )
-from kiro_crew.messaging.session_resume import RoutingDecision
+from kiro_crew.messaging.session_resume import ResumeBinding, RoutingDecision
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.session import BACKGROUND_KEY, _opt_out_key
 from kiro_crew.session_allocation import SessionClosingError
@@ -4128,7 +4128,9 @@ class TestTelegramMidTurn:
         async def _go() -> None:
             # Build the receipt + queue via the real enqueue path (52 > cap 50).
             for i in range(52):
-                await d._enqueue_with_receipt(key, 7, f"m{i}", origin=_tg_origin())
+                await d._enqueue_with_receipt(
+                    ResumeBinding(resumed_key=None).at(key), 7, f"m{i}", origin=_tg_origin()
+                )
             sess._busy = False  # turn finished
             await d._drain_queue(key)
 
@@ -4145,7 +4147,10 @@ class TestTelegramMidTurn:
 
         async def _go() -> bool:
             return await d._enqueue_with_receipt(
-                "telegram:kirocrew:direct:7", 7, "late message", origin=_tg_origin()
+                ResumeBinding(resumed_key=None).at("telegram:kirocrew:direct:7"),
+                7,
+                "late message",
+                origin=_tg_origin(),
             )
 
         queued = asyncio.run(_go())
@@ -5154,7 +5159,7 @@ class TestDrainSenderIdentity:
             sess._busy = True
             for msg in msgs:
                 assert await d._enqueue_with_receipt(
-                    self._KEY,
+                    ResumeBinding(resumed_key=None).at(self._KEY),
                     int(msg.conversation_id),
                     msg.text,
                     origin=_inbound_origin(msg),
