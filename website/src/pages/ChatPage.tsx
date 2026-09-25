@@ -5044,7 +5044,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     navigate(settingsPath({ tab: 'chat', sub: 'models', highlight: SETTINGS_DEFAULT_MODEL_ID }))
   }, [navigate])
   // The Kiro sign-in card (an `auth_required` error row's fix) lives on the
-  // full dashboard's Developer > Agent Backend tab, under the switch that
+  // full dashboard's Settings > Agent Harness tab, under the switch that
   // selects the KAS backend the row can only come from; same surface rule as
   // the Default Model link above.
   const openKiroSignIn = useCallback(() => {
