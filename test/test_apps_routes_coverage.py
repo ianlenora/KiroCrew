@@ -1174,6 +1174,24 @@ class TestUpdateApp:
             assert resp.status == 404
 
     @pytest.mark.asyncio
+    async def test_provenance_invalidation_reports_confirmed_vs_unconfirmed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The update seam drops the pre-update spawn record before any restart and
+        reports whether the drop is CONFIRMED. A confirmed drop returns True (restart
+        allowed); an unconfirmed one (ENOSPC/EDQUOT: forget raises) returns False so
+        the caller does NOT restart and adopt the stale-row survivor as the new code."""
+
+        monkeypatch.setattr(routes_mod, "forget_backend_provenance", lambda n: {"pid": 1})
+        assert await routes_mod._invalidate_provenance_before_restart("app") is True
+
+        def _raise(n: str) -> None:
+            raise routes_mod.PidfileDeleteFailed("disk full")
+
+        monkeypatch.setattr(routes_mod, "forget_backend_provenance", _raise)
+        assert await routes_mod._invalidate_provenance_before_restart("app") is False
+
+    @pytest.mark.asyncio
     async def test_self_managed_lifecycle_is_refused(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1768,6 +1786,121 @@ class TestUninstallRefusals:
         assert calls == [(APP, True)]
 
     @pytest.mark.asyncio
+    async def test_provenance_deleted_only_at_the_commit_boundary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GPT crash-safety (option b): the spawn-provenance record is deleted ONLY
+        after uninstall_app durably removes the files — the commit boundary — not up
+        front. So on a successful uninstall the delete runs exactly once, after the
+        removal."""
+
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        order: list[str] = []
+
+        def _real_removal(name: str, keep_data: bool = False) -> AppResult:
+            order.append("uninstall_app")
+            return AppResult(ok=True)
+
+        monkeypatch.setattr(routes_mod, "uninstall_app", _real_removal)
+
+        def _drop(n: str) -> dict[str, Any]:
+            order.append("provenance_delete")
+            return {"pid": 1}
+
+        monkeypatch.setattr(routes_mod, "forget_backend_provenance", _drop)
+
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/uninstall", json={})
+            assert resp.status == 200
+        # The removal committed FIRST, then provenance was deleted — never before.
+        assert order == ["uninstall_app", "provenance_delete"]
+
+    @pytest.mark.asyncio
+    async def test_failed_uninstall_never_touches_provenance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GPT crash-safety (option b): a failed uninstall_app leaves the app
+        installed, and because the provenance delete runs only on result.ok, the
+        record is never touched — nothing to restore, the app keeps attributing its
+        backend."""
+
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        deletes: list[str] = []
+        monkeypatch.setattr(
+            routes_mod, "forget_backend_provenance", lambda n: deletes.append(n)
+        )
+
+        def _fail_removal(*args: Any, **kwargs: Any) -> AppResult:
+            return AppResult(ok=False, error="rmtree failed")
+
+        monkeypatch.setattr(routes_mod, "uninstall_app", _fail_removal)
+
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/uninstall", json={})
+            assert resp.status == 400
+        # The delete only runs at the commit boundary (result.ok), so a failed
+        # removal never reached it: the row is left intact.
+        assert deletes == []
+
+    @pytest.mark.asyncio
+    async def test_interruption_before_commit_leaves_the_provenance_row_intact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GPT crash-safety (option b): the delete is at the commit boundary, so an
+        interruption anywhere before it (here onUninstall raises) never deletes
+        provenance — the row stays on disk and the next-boot reap handles the orphan.
+        No window where the row is gone while the app survives."""
+
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path, setup={"onUninstall": "teardown.sh"})
+        deletes: list[str] = []
+        monkeypatch.setattr(
+            routes_mod, "forget_backend_provenance", lambda n: deletes.append(n)
+        )
+
+        async def _blow_up_mid_window(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("gateway interrupted during onUninstall")
+
+        monkeypatch.setattr(routes_mod, "_run_lifecycle_script", _blow_up_mid_window)
+
+        def _uninstall_must_not_run(*args: Any, **kwargs: Any) -> AppResult:
+            raise AssertionError("uninstall_app ran after the mid-window interruption")
+
+        monkeypatch.setattr(routes_mod, "uninstall_app", _uninstall_must_not_run)
+
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/uninstall", json={})
+            assert resp.status == 500
+        # The commit boundary was never reached, so provenance was never deleted.
+        assert deletes == []
+
+    @pytest.mark.asyncio
+    async def test_unconfirmed_delete_at_commit_is_logged_not_aborted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GPT crash-safety (option b): a delete that cannot be confirmed AT the
+        commit boundary (ENOSPC) is logged, not raised — the files are already
+        removed, so there is nothing to roll back and the next-boot reap clears the
+        stale row. The uninstall still reports success."""
+
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+
+        monkeypatch.setattr(routes_mod, "uninstall_app", lambda *a, **k: AppResult(ok=True))
+
+        def _delete_fails(name: str) -> dict[str, Any]:
+            raise routes_mod.PidfileDeleteFailed("no space left on device")
+
+        monkeypatch.setattr(routes_mod, "forget_backend_provenance", _delete_fails)
+
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/uninstall", json={})
+            # Files already removed: the unconfirmed delete does not fail the uninstall.
+            assert resp.status == 200
+
+    @pytest.mark.asyncio
     async def test_removable_dependencies_are_cleaned_and_reported(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1843,7 +1976,7 @@ class TestUninstallRefusals:
             }
 
         monkeypatch.setattr(routes_mod, "_run_lifecycle_script", _script)
-        monkeypatch.setattr(routes_mod, "stop_app_backend", lambda n: None)
+        monkeypatch.setattr(routes_mod, "stop_app_backend", lambda n, **_kw: None)
         async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/uninstall", json={})
             assert resp.status == 200
@@ -1866,7 +1999,7 @@ class TestUninstallRefusals:
                 ok=False, name=name, error="permission denied"
             ),
         )
-        monkeypatch.setattr(routes_mod, "stop_app_backend", lambda n: None)
+        monkeypatch.setattr(routes_mod, "stop_app_backend", lambda n, **_kw: None)
         async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/uninstall", json={})
             assert resp.status == 400
