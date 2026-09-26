@@ -40,6 +40,9 @@ from kiro_crew.autonudge_service.timers import (
     _MONITOR_RETRY_MAX_BACKOFF_SECS,
     _REARM_BACKOFF_MAX_SHIFT,
 )
+from kiro_crew.goal import (
+    GOAL_TERMINAL_STATUSES,
+)
 from kiro_crew.monitoring.decision import (
     decide_monitor,
     monitor_budget_reason,
@@ -170,6 +173,11 @@ async def _add_monitor_locked(
                 ):
                     raise MonitorUpdateConflict("monitor changed before restart")
             if existing:
+                if existing.goal is not None and existing.goal.status not in GOAL_TERMINAL_STATUSES:
+                    raise MonitorUpdateConflict(
+                        "this session has an unfinished goal; start the new automation or watch "
+                        "in another session to keep this goal intact"
+                    )
                 # Same split as the legacy add: create-only refuses ANY
                 # record unless the caller opted into ``replace_stopped``,
                 # which under the owner's ruling displaces only
