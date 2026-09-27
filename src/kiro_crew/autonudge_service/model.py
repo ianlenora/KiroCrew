@@ -16,8 +16,15 @@ import math
 import secrets
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
-from kiro_crew.monitoring.models import MonitorOutcome, MonitorState, retained_outcome_blocks_rearm
+from kiro_crew.monitoring.models import (
+    MAX_MONITOR_STOP_REASON_CHARS,
+    MonitorOutcome,
+    MonitorState,
+    retained_outcome_blocks_rearm,
+)
+from kiro_crew.security import redact_and_truncate
 
 #: ``stopped_reason`` for a loop whose watched subject finished (a merged or
 #: closed pull request). Distinct from the bound reasons because there is nothing
@@ -258,6 +265,21 @@ class AutoNudgeStoreUnvetted(RuntimeError):
     """
 
 
+def normalize_stopped_detail(value: Any) -> str:
+    """The one spelling of ``NudgeLoop.stopped_detail`` every boundary applies.
+
+    A non-string is no detail. A string is redacted (credentials,
+    exfiltration URLs) and capped at ``MAX_MONITOR_STOP_REASON_CHARS`` -- the
+    same cap a structured monitor's stop reason carries. Applied on the
+    write (``update``), on ``_load`` (the store is agent-writable) and again
+    on the REST output (``handlers.autonudge._serialize``), so no path can
+    hand a reader a raw persisted value.
+    """
+    if not isinstance(value, str):
+        return ""
+    return redact_and_truncate(value, MAX_MONITOR_STOP_REASON_CHARS)
+
+
 @dataclass
 class NudgeLoop:
     """A single auto-nudge loop bound to one session.
@@ -485,6 +507,10 @@ class NudgeLoop:
     # concurrency framework. Absent in a store written before this field ->
     # decodes to 0, and a first fire simply captures 0.
     config_generation: int = 0
+    # WHY, in the stopping party's own words: the redacted, length-capped
+    # free-text reason a directive stop was given. Set only on a deactivation
+    # that supplies one and cleared on every revival.
+    stopped_detail: str = ""
 
 
 def is_structured_monitor_loop(loop: NudgeLoop) -> bool:

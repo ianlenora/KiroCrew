@@ -246,6 +246,7 @@ class TestShippedScenarios:
                 "crewmate-chat-clean",
                 "crewmate-create-first",
                 "crewmate-panel-tabs",
+                "crewmate-perpetual-off",
                 "crewmate-reply-thread",
                 "crewmate-team-view",
                 "members-dm-hello",

@@ -33,6 +33,19 @@ if TYPE_CHECKING:
     from kiro_crew.autonudge import AutoNudgeService
 
 
+async def _await_future_deferring_cancellation(
+    future: "asyncio.Future[Any]",
+) -> tuple[Any, bool]:
+    """Join *future* and report cancellation only after its result is known."""
+    cancelled = False
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            cancelled = True
+    return future.result(), cancelled
+
+
 def _maintenance_lock(base_dir: Path) -> asyncio.Lock:
     """Per-event-loop lock serializing store maintenance with service startup."""
     from kiro_crew import autonudge as seams  # read at call time: the facade imports us

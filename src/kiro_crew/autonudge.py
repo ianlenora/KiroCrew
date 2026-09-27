@@ -53,7 +53,7 @@ import os
 import time
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Mapping
 
 from kiro_crew import irq  # noqa: F401 -- read off this module by callers and tests
 from kiro_crew import autonudge_stop_log, validation
@@ -108,6 +108,7 @@ from kiro_crew.autonudge_service.model import (  # noqa: F401 -- re-exported
     is_channel_key,
     is_structured_monitor_loop,
     new_goal_token,
+    normalize_stopped_detail,
     nudge_cycle_header,
     runtime_budget_exceeded,
     terminal_notification_delivery_matches,
@@ -159,6 +160,8 @@ from kiro_crew.monitoring.models import (  # noqa: F401 -- MonitorState: read of
 )
 from kiro_crew.platform import PlatformCompositionError, redact_log_via_context, redact_via_context
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
+
+_await_future_deferring_cancellation = _maintenance._await_future_deferring_cancellation
 
 logger = logging.getLogger(__name__)
 
@@ -765,14 +768,14 @@ class AutoNudgeService:
         # mutation supervised (no GC, failures logged) even when every awaiting
         # caller was cancelled. Discarded on completion.
         self._inflight_adds: set = set()
-        # Structured replacements whose prior row must keep its protected trust
-        # until the caller completes a second durable authorization step. The
-        # monitor snapshot and the protected trust record are separate files, so
-        # the authorizer either commits this entry after activating the new grant
-        # or rolls the monitor snapshot back to it.
-        self._deferred_monitor_replacements: dict[str, tuple[NudgeLoop | None, NudgeLoop, bool]] = (
-            {}
-        )
+        # Structured replacements whose prior row may need its protected trust
+        # restored if the caller rolls the monitor snapshot back. The tuple
+        # carries provider authorization and strict owner-arm revocation
+        # separately: self-arm trust remains on the historical deferred path,
+        # while owner admission must be gone before the prior row disappears.
+        self._deferred_monitor_replacements: dict[
+            str, tuple[NudgeLoop | None, NudgeLoop, bool, Any]
+        ] = {}
         # Runtime turn-start evidence for the narrow window between a channel
         # accepting a claimed wake and the controller persisting DISPATCHED.
         # One monitor can own only one claim, so the loop id maps directly to
@@ -996,6 +999,16 @@ class AutoNudgeService:
                             _cg,
                         )
                         loop_values["config_generation"] = 0
+                # ``stopped_detail`` is display text from an agent-writable
+                # store: anything but a string reads as no detail, and a
+                # string is redacted and capped here exactly as the write
+                # path caps it, so a hand-edited value never reaches a
+                # reader longer or more sensitive than one the gateway
+                # itself would have stored.
+                if "stopped_detail" in loop_values:
+                    loop_values["stopped_detail"] = normalize_stopped_detail(
+                        loop_values["stopped_detail"]
+                    )
                 loop = NudgeLoop(**loop_values)
                 # Rotated on EVERY load: a human may have hand-edited the goal while we
                 # were down, so a pre-restart token must not authorise overwriting it.
@@ -1197,6 +1210,24 @@ class AutoNudgeService:
                     fallback=float(_MIN_IDLE_SECS),
                 )
                 loop.idle_secs = int(idle_num)
+                created_ts, created_repaired = _repair_number(loop.created_ts, lo=0.0, fallback=0.0)
+                loop.created_ts = created_ts
+                last_fire_ts, last_fire_repaired = _repair_number(
+                    loop.last_fire_ts, lo=0.0, fallback=0.0
+                )
+                loop.last_fire_ts = last_fire_ts
+                max_cycles_num, max_cycles_repaired = _repair_number(
+                    loop.max_cycles, lo=0.0, fallback=0.0
+                )
+                loop.max_cycles = int(max_cycles_num)
+                cycle_count_num, cycle_count_repaired = _repair_number(
+                    loop.cycle_count, lo=0.0, fallback=0.0
+                )
+                loop.cycle_count = int(cycle_count_num)
+                runtime_num, runtime_repaired = _repair_number(
+                    loop.max_runtime_secs, lo=0.0, fallback=0.0
+                )
+                loop.max_runtime_secs = int(runtime_num)
                 # ``consecutive_start_failures`` is compared with ``>=`` on every
                 # wake, and this store is agent-writable, so a persisted string or
                 # ``null`` would raise ``TypeError`` inside ``_timer`` and the
@@ -1220,7 +1251,15 @@ class AutoNudgeService:
                     # its atomically-persisted inspection mirror.
                     loop.monitor.next_probe_at = loop.next_due_ts
                     self._store_dirty = True
-                if due_repaired or idle_repaired:
+                if (
+                    due_repaired
+                    or idle_repaired
+                    or created_repaired
+                    or last_fire_repaired
+                    or max_cycles_repaired
+                    or cycle_count_repaired
+                    or runtime_repaired
+                ):
                     self._store_dirty = True
                 notification_stopped_at, notification_time_repaired = _repair_number(
                     loop.terminal_notification_stopped_at,
@@ -1378,6 +1417,35 @@ class AutoNudgeService:
                 for loop_id, summary in autonudge_stop_log.active_summaries(store_rows).items()
                 if loop_id in self._loops
             }
+        try:
+            from kiro_crew import autonudge_provider_trust, autonudge_selfarm
+
+            accepted_loop_rows = {
+                loop.id: (
+                    loop.slot_key,
+                    autonudge_selfarm.durable_loop_row_fingerprint(
+                        self._durable_loop_row(loop),
+                        loop.slot_key,
+                    ),
+                    bool(loop.active),
+                    int(loop.max_cycles),
+                    int(loop.max_runtime_secs),
+                )
+                for loop in self._loops.values()
+            }
+            autonudge_selfarm.recover_owner_arm_revocation(accepted_loop_rows)
+            live_monitors = {
+                loop.id: (loop.slot_key, loop.monitor.kind, loop.monitor.target)
+                for loop in self._loops.values()
+                if loop.monitor is not None
+            }
+            autonudge_provider_trust.recover_monitor_owner_credentials(live_monitors)
+        except (OSError, ValueError):
+            logger.error(
+                "AutoNudge: durable monitor trust transaction could not be recovered; "
+                "affected authorization remains fail-closed",
+                exc_info=True,
+            )
         logger.info("AutoNudge: loaded %d loops", len(self._loops))
 
     @classmethod
@@ -1432,6 +1500,15 @@ class AutoNudgeService:
             "loops": self._serialized_loops(),
         }
         return payload
+
+    def _durable_loop_row(
+        self,
+        candidate: NudgeLoop,
+        *,
+        serialized: NudgeLoop | None = None,
+    ) -> dict[str, Any]:
+        """Serialize the exact durable row, including disk-only claim markers."""
+        return self._store.durable_loop_row(candidate, self._serialize_loop, serialized=serialized)
 
     def _serialized_loops(
         self,
@@ -1573,25 +1650,51 @@ class AutoNudgeService:
     def list_all(self) -> list[NudgeLoop]:
         return list(self._loops.values())
 
-    async def _write_monitor_snapshot_locked(self, payload: dict | None = None) -> None:
-        """Persist a monitor transition without releasing ``_lock`` mid-write."""
+    def _assert_deferred_replacements_unchanged(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        allow: set[str] | None = None,
+    ) -> None:
+        """Verify a snapshot preserves every replacement still awaiting trust."""
+        rows = payload.get("loops")
+        if not isinstance(rows, list):
+            raise MonitorUpdateConflict("monitor snapshot has no loop rows")
+        allowed = allow or set()
+        for loop_id, pending in self._deferred_monitor_replacements.items():
+            if loop_id in allowed:
+                continue
+            replacement = pending[1]
+            matching = [row for row in rows if isinstance(row, dict) and row.get("id") == loop_id]
+            if len(matching) != 1 or matching[0] != self._serialize_loop(replacement):
+                raise MonitorUpdateConflict(
+                    "monitor replacement authorization is still being finalized"
+                )
+
+    async def _write_monitor_snapshot_locked(
+        self,
+        payload: dict | None = None,
+        *,
+        defer_cancellation: bool = False,
+        allow_deferred_replacement_ids: set[str] | None = None,
+    ) -> bool:
+        """Persist a monitor transition without releasing ``_lock`` mid-write.
+
+        When ``defer_cancellation`` is true, return whether cancellation landed
+        after joining the write. Removal/replacement transactions use that signal
+        to finalize or compensate trust before propagating cancellation.
+        """
         if payload is None:
             payload = self._serialize_state()
+        self._assert_deferred_replacements_unchanged(
+            payload,
+            allow=allow_deferred_replacement_ids,
+        )
         future = asyncio.get_running_loop().run_in_executor(None, self._write_state, payload)
-        cancelled = False
-        while not future.done():
-            try:
-                await asyncio.shield(future)
-            except asyncio.CancelledError:
-                # Executor writes cannot be cancelled. Absorb every
-                # cancellation until the write settles so the caller's lock
-                # scope cannot release around an older snapshot.
-                cancelled = True
-        future.result()
-        if cancelled:
-            # Propagate cancellation only after the executor result has been
-            # observed while the caller still owns the lock.
+        _result, cancelled = await _await_future_deferring_cancellation(future)
+        if cancelled and not defer_cancellation:
             raise asyncio.CancelledError
+        return cancelled
 
     def _find_by_slot(self, slot_key: str) -> NudgeLoop | None:
         """The loop bound to *slot_key*, which may be a binding key OR a tab name.
@@ -1693,6 +1796,12 @@ class AutoNudgeService:
     remove_sync = _mutations.remove_sync
     _revoke_self_arm_for = _mutations._revoke_self_arm_for
     _revoke_self_arm = staticmethod(_mutations._revoke_self_arm)
+    _assert_monitor_replacement_mutable = _mutations._assert_monitor_replacement_mutable
+    _prepare_trust_before_removal = _mutations._prepare_trust_before_removal
+    _rollback_trust_after_failed_removal = staticmethod(
+        _mutations._rollback_trust_after_failed_removal
+    )
+    _commit_owner_revocation = staticmethod(_mutations._commit_owner_revocation)
     remove = _mutations.remove
     remove_by_slot = _mutations.remove_by_slot
     clear_terminal_monitor = _mutations.clear_terminal_monitor

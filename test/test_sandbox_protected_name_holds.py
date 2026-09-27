@@ -321,6 +321,12 @@ class TestLeafOnlyPopulationIsRecorded:
     #: launch fingerprints; ``mcp/resolved`` holds executables substituted for an
     #: approved launch. Each sits beside writable siblings, so no parent stand-in
     #: can hold it.
+    #:
+    #: The auto-nudge arm record (``tag-grants/autonudge-trust``) is deliberately
+    #: NOT among them: it is a nested leaf inside an existing whole-directory
+    #: stand-in, so it lands in ``HELD_BY_ENCLOSING_MASK`` and costs this count
+    #: nothing. A root-level ``autonudge-trust`` leaf would add three entries per
+    #: tier and weaken the existing enclosing-directory hold.
     EXPECTED: dict[str, int] = {"standard": 262, "cc": 269, "strict": 270}
 
     @pytest.mark.parametrize("tier", TIERS)
