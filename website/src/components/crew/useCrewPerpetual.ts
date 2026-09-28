@@ -40,14 +40,6 @@ import {
   AUTONUDGE_LOOPS_QUERY_KEY,
   type AutoNudgeLoop,
 } from "../autoNudgeLoop";
-import {
-  PERPETUAL_DEFAULT_BANNER,
-  PERPETUAL_DEFAULT_INSTRUCTION,
-  PERPETUAL_FEATURE_NAME,
-} from "./perpetualBrief.prompt";
-
-export { PERPETUAL_DEFAULT_BANNER, PERPETUAL_DEFAULT_INSTRUCTION };
-
 /** How often the registry is re-read while nobody pushes a frame. Coarse: the
  *  frames carry the changes; this only catches a frame lost to a dropped socket. */
 const PERPETUAL_REFRESH_MS = 30_000;
@@ -59,10 +51,8 @@ const PERPETUAL_REFRESH_MS = 30_000;
  * retunes its own from inside a wake (`monitor_update`).
  *
  * Read ONLY to state the first-wake timing and the per-day estimate BEFORE a
- * record exists -- once one does, its `idle_secs` is the truth. Kept in lockstep
- * with the backend the same way `perpetualBrief.prompt.ts` is: if the default
- * changes there, the estimate shown for a crewmate with no record yet is the one
- * thing that drifts, and it is labelled an estimate.
+ * record exists -- once one does, its `idle_secs` is the truth. If the backend
+ * default changes, this estimate can drift, so the UI labels it as an estimate.
  */
 export const PERPETUAL_DEFAULT_IDLE_SECS = 3600;
 
@@ -102,33 +92,14 @@ export function wakesPerDay(idleSecs: number): number {
 
 export type CrewPerpetualState = "on" | "off" | "none";
 
-/** Is this line the switch's own default brief (see perpetualBrief.prompt.ts)
- *  or the bare feature name? Both hosts show a loop's instruction line; for a
- *  loop the SWITCH armed that line only restates the feature the block is
- *  already titled with, so the hosts hide it. A crewmate that rewrote its own
- *  brief (`monitor_update`) keeps its line: only these exact strings are the
- *  default. */
-export function isDefaultPerpetualBrief(text: string | undefined): boolean {
-  const s = (text ?? "").trim();
-  return (
-    s === "" ||
-    s === PERPETUAL_DEFAULT_BANNER ||
-    s === PERPETUAL_DEFAULT_INSTRUCTION ||
-    s === PERPETUAL_FEATURE_NAME
-  );
-}
-
-/** The instruction line a host shows for a loop, or '' when every candidate
- *  is the default: the banner when it says something of its own, else the
- *  message when THAT does (a member that changed its brief but kept the
- *  banner), else nothing. */
+/** The instruction line a host shows for a loop. Prefer its short banner;
+ * otherwise show the full message. The backend owns both strings, so the UI
+ * never copies them merely to decide whether they are worth showing. */
 export function perpetualBriefText(loop: {
   banner?: string;
   message?: string;
 }): string {
-  if (!isDefaultPerpetualBrief(loop.banner)) return loop.banner ?? "";
-  if (!isDefaultPerpetualBrief(loop.message)) return loop.message ?? "";
-  return "";
+  return loop.banner?.trim() ? loop.banner : (loop.message ?? "");
 }
 
 export interface CrewPerpetualReading {
@@ -159,6 +130,11 @@ export interface CrewPerpetualReading {
    *  says. `true` until the registry has answered, so a loading card never
    *  claims the mode is unavailable. */
   enabled: boolean;
+  /** Re-ask BOTH reads. The host's `failed` notice offers it: a read that
+   *  never answered is usually transient, and the reading is assembled from
+   *  two queries, so retrying only the one that failed would leave the other
+   *  on its stale answer. */
+  retry: () => void;
 }
 
 export interface CrewPerpetualOptions {
@@ -232,7 +208,9 @@ export function useCrewPerpetual(
           : "none";
   // A record the roster does not count as the switch's loop (a structured
   // monitor's reduced row) carries no readouts worth showing under the switch.
-  const loop = state === "none" ? undefined : record;
+  // Its positive marker prevents full self-arm and capped rows that also read
+  // `none` from inheriting the structured monitor's stop advice.
+  const loop = record?.record_kind === "structured_monitor" ? undefined : record;
   const rosterLoaded = roster.data !== undefined || roster.isError;
   const loopsLoaded = loops.data !== undefined || loops.isError;
   // A refetch error after a good read keeps the last data: only a read that
@@ -249,7 +227,11 @@ export function useCrewPerpetual(
     loaded: rosterLoaded && loopsLoaded,
     failed,
     missing: roster.data !== undefined && !row,
-    monitor: state === "none" && !!record,
+    monitor: state === "none" && record?.record_kind === "structured_monitor",
     enabled: loops.data === undefined || loops.data.enabled !== false,
+    retry: () => {
+      void roster.refetch();
+      void loops.refetch();
+    },
   };
 }

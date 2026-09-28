@@ -291,6 +291,7 @@ async def _add_monitor_locked(
                         deepcopy(loop),
                         restore_prior_provider_credentials,
                         prior_owner_revocation,
+                        existing,
                     )
                 else:
                     transaction_cancelled = (
@@ -304,6 +305,7 @@ async def _add_monitor_locked(
                     None,
                     deepcopy(loop),
                     False,
+                    None,
                     None,
                 )
             self._loops[loop.id] = loop
@@ -332,6 +334,7 @@ async def commit_monitor_replacement(self: AutoNudgeService, loop_id: str) -> bo
                 replacement,
                 _restore_prior_provider_credentials,
                 prior_owner_revocation,
+                _original_prior,
             ) = pending
             current = self._loops.get(loop_id)
             if current is None or self._serialize_loop(current) != self._serialize_loop(
@@ -368,6 +371,7 @@ async def rollback_monitor_replacement(self: AutoNudgeService, loop_id: str) -> 
                 replacement,
                 restore_prior_provider_credentials,
                 prior_owner_revocation,
+                original_prior,
             ) = self._deferred_monitor_replacements[loop_id]
             current = self._loops.get(loop_id)
             if current is None or self._serialize_loop(current) != self._serialize_loop(
@@ -393,6 +397,7 @@ async def rollback_monitor_replacement(self: AutoNudgeService, loop_id: str) -> 
                     replacement,
                     restore_prior_provider_credentials,
                     prior_owner_revocation,
+                    original_prior,
                 )
                 raise
             payload = {
@@ -419,6 +424,7 @@ async def rollback_monitor_replacement(self: AutoNudgeService, loop_id: str) -> 
                     replacement,
                     restore_prior_provider_credentials,
                     prior_owner_revocation,
+                    original_prior,
                 )
                 raise
             self._deferred_monitor_replacements.pop(loop_id, None)
@@ -430,6 +436,10 @@ async def rollback_monitor_replacement(self: AutoNudgeService, loop_id: str) -> 
             if removed is not None:
                 self._revoke_self_arm_for(removed)
             if prior is not None:
+                if original_prior is not None and self._serialize_loop(
+                    original_prior
+                ) == self._serialize_loop(prior):
+                    prior = original_prior
                 self._loops[prior.id] = prior
                 transaction_cancelled = (
                     await self._rollback_trust_after_failed_removal(

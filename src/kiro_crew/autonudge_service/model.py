@@ -145,6 +145,10 @@ SENTINEL_DROPPED_REASON = "sentinel_dropped"
 MANUAL_STOP_REASON = "manual"
 
 
+# Stored numeric caps that cannot be repaired safely stop the loop.
+INVALID_BOUNDS_REASON = "invalid_bounds"
+
+
 #: Stops the SYSTEM imposed on a legacy loop, which a directive re-arm may
 #: therefore displace: a lapsed approval, a spent bound, a finished subject, a
 #: dropped kill switch. Everything else — a manual pause (``"manual"``), a
@@ -154,6 +158,7 @@ MANUAL_STOP_REASON = "manual"
 #: CLOSED to preserved.
 _REPLACEABLE_LOOP_STOP_REASONS = _TERMINAL_BOUND_REASONS | {
     MONITOR_TERMINAL_REASON,
+    INVALID_BOUNDS_REASON,
     SENTINEL_DROPPED_REASON,
 }
 

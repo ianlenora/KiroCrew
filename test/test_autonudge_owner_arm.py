@@ -28,10 +28,12 @@ the trust record against a temporary data home.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import hmac
 import json
 import logging
+import os
 import shutil
 import stat
 from pathlib import Path
@@ -314,6 +316,53 @@ async def test_owner_entry_is_forgotten_when_the_add_conflicts(
     assert loop is None and status == 409
     reserved = svc.added[0]["loop_id"]
     assert sa.is_recorded_owner_arm(reserved, "member-scout") is False
+
+
+@pytest.mark.asyncio
+async def test_owner_entry_stays_with_committed_conflict_for_recovery(
+    audits: list[dict[str, Any]], trust_home: Path, tmp_path: Path
+) -> None:
+    from kiro_crew.autonudge import MonitorUpdateConflict
+
+    class CommittedConflictSvc(RecordingSvc):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stored: NudgeLoop | None = None
+            self.rolled_back = False
+
+        async def add(self, **kw: Any) -> Any:
+            self.added.append(kw)
+            self.stored = NudgeLoop(
+                id=kw["loop_id"],
+                slot_key=kw["slot_key"],
+                message=kw["message"],
+                idle_secs=kw["idle_secs"],
+            )
+            raise MonitorUpdateConflict("owner admission changed")
+
+        def get_by_id(self, loop_id: str) -> NudgeLoop | None:
+            return self.stored if self.stored is not None and self.stored.id == loop_id else None
+
+        async def rollback_monitor_replacement(self, _loop_id: str) -> bool:
+            self.rolled_back = True
+            raise AssertionError("compare conflicts must not roll back with a stale token")
+
+    svc = CommittedConflictSvc()
+    loop, error, status = await authorize_and_add_nudge(
+        svc=svc,
+        state=_state({"member-scout": _slot("member")}),
+        slot_key="member-scout",
+        message="perpetual",
+        stop_sentinel_path=str(tmp_path / "stop"),
+        source="dashboard",
+        owner_arm=True,
+    )
+    assert loop is None and status == 409
+    assert error == "owner admission changed"
+    assert svc.rolled_back is False
+    reserved = svc.added[0]["loop_id"]
+    assert svc.get_by_id(reserved) is not None
+    assert sa.is_recorded_owner_arm(reserved, "member-scout") is True
 
 
 # ── (c) the fire-time guard ─────────────────────────────────────────────────
@@ -1112,6 +1161,43 @@ class TestPerpetualRoute:
         # ``active: true``. Siblings stay.
         assert sa._armed_by_of(running.id, running.slot_key) == ""
         assert sa.is_recorded_self_arm("sibling1", "member-other") is True
+
+    @pytest.mark.asyncio
+    async def test_off_keeps_a_pending_owner_takeover_paused_through_restart(
+        self, quiet_authz_audit: list[dict[str, Any]], trust_home: Path
+    ) -> None:
+        running = NudgeLoop(
+            id="pendingoff1",
+            slot_key="member-scout",
+            message="perpetual",
+            idle_secs=3600,
+            max_cycles=0,
+            max_runtime_secs=0,
+            active=True,
+            next_due_ts=9_999.0,
+        )
+        sa.record_self_arm(running.id, running.slot_key)
+        sa.begin_owner_arm_takeover(running.id, running.slot_key, "self")
+        svc = FakeLoopSvc(running)
+        with _route_patches(svc):
+            async with TestClient(
+                TestServer(_make_app({"member-scout": _member_slot_obj()}))
+            ) as client:
+                resp = await client.post(
+                    f"/api/members/{CREW}/perpetual",
+                    json={"member": CREW, "enabled": False},
+                )
+                await resp.read()
+        assert resp.status == 503
+        body = await resp.json()
+        assert body["code"] == "perpetual_off_failed"
+        assert "pending owner takeover" in body["error"]
+        assert [u["active"] for u in svc.updates] == [False]
+        assert running.active is False
+
+        sa.recover_owner_arm_revocation({running.id: (running.slot_key, "unused", False, 0, 0)})
+        assert sa.is_recorded_self_arm(running.id, running.slot_key) is True
+        assert sa.is_recorded_owner_arm(running.id, running.slot_key) is False
 
     @pytest.mark.asyncio
     async def test_off_reports_a_revoke_that_could_not_be_written_and_restores_the_loop(
@@ -2034,7 +2120,7 @@ class TestPerpetualRoute:
         assert members_audit[0]["tool_name"] == "autonudge_start"
 
     @pytest.mark.asyncio
-    async def test_on_leaves_an_active_unlimited_self_arm_self_owned(
+    async def test_on_takes_over_an_active_unlimited_self_arm(
         self,
         quiet_authz_audit: list[dict[str, Any]],
         members_audit: list[dict[str, Any]],
@@ -2062,8 +2148,9 @@ class TestPerpetualRoute:
                 await resp.read()
         assert resp.status == 200
         assert svc.updates == [] and svc.added == []
-        assert sa.is_recorded_self_arm(unlimited.id, unlimited.slot_key) is True
-        assert members_audit == []
+        assert sa.is_recorded_owner_arm(unlimited.id, unlimited.slot_key) is True
+        assert sa.is_recorded_self_arm(unlimited.id, unlimited.slot_key) is False
+        assert members_audit[0]["tool_name"] == "autonudge_start"
 
     @pytest.mark.asyncio
     async def test_failed_active_self_takeover_restores_the_self_party(
@@ -2135,6 +2222,253 @@ class TestPerpetualRoute:
                     assert resp.status == 409
                     assert (await resp.json())["code"] == "structured_monitor_not_convertible"
         assert svc.updates == [] and svc.added == []
+
+    @staticmethod
+    def _structured_monitor_row(loop_id: str = "mon00002") -> NudgeLoop:
+        from kiro_crew.monitoring.models import MonitorBudgets, MonitorState
+
+        loop = NudgeLoop(id=loop_id, slot_key="member-scout", message="", idle_secs=300)
+        loop.monitor = MonitorState(
+            kind="github_pull_request",
+            target="https://github.com/acme/widgets/pull/7",
+            objective="review_ready",
+            created_ts=1_000.0,
+            budgets=MonitorBudgets(
+                max_runtime_secs=14_400,
+                max_agent_turns=8,
+                max_tokens=250_000,
+                max_provider_errors=3,
+            ),
+            cadence_secs=300,
+        )
+        return loop
+
+    @pytest.mark.asyncio
+    async def test_structured_monitor_off_revokes_stale_arms_but_keeps_its_own_admission(
+        self,
+        quiet_authz_audit: list[dict[str, Any]],
+        trust_home: Path,
+        members_audit: list[dict[str, Any]],
+    ) -> None:
+        """OFF is the owner's ONLY control over this slot's recorded
+        authorizations, and a structured monitor occupying the slot must not
+        put them out of reach: an owner or self arm whose Perpetual row the
+        agent-writable store dropped before the monitor took the slot is a
+        standing fire-time admission for a forged row under its id. OFF revokes
+        every such stale entry before refusing the monitor's own transition,
+        but preserves the live monitor's matching self-arm admission. The
+        monitor row is never written, and no other slot's entry is touched."""
+        loop = self._structured_monitor_row()
+        loop.self_armed = True
+        sa.record_self_arm(loop.id, "member-scout")
+        sa.record_owner_arm("gone0004", "member-scout")
+        sa.record_self_arm("gone0005", "member-scout")
+        sa.record_owner_arm("keep0002", "member-other")
+        before = dataclasses.asdict(loop)
+        svc = FakeLoopSvc(loop)
+        with _route_patches(svc):
+            async with TestClient(
+                TestServer(_make_app({"member-scout": _member_slot_obj()}))
+            ) as client:
+                resp = await client.post(
+                    f"/api/members/{CREW}/perpetual", json={"member": CREW, "enabled": False}
+                )
+                await resp.read()
+        assert resp.status == 409, await resp.text()
+        assert (await resp.json())["code"] == "structured_monitor_not_convertible"
+        # The monitor itself: same row, same fields, no update and no add.
+        assert svc.updates == [] and svc.added == []
+        assert svc.loop is loop and dataclasses.asdict(loop) == before
+        # Stale entries of this slot are gone; the live monitor's entry stands.
+        assert sa._armed_by_of("gone0004", "member-scout") == ""
+        assert sa._armed_by_of("gone0005", "member-scout") == ""
+        assert sa.is_recorded_self_arm(loop.id, "member-scout") is True
+        assert sa.is_recorded_owner_arm("keep0002", "member-other") is True
+        # One critical ``perpetual_revoke`` event per entry, written before its
+        # revoke, and nothing else on the members sink (the monitor row got no
+        # audited update because it got no update).
+        revokes = [e for e in members_audit if e.get("tool_name") == "perpetual_revoke"]
+        assert sorted(e["metadata"]["loop_id"] for e in revokes) == ["gone0004", "gone0005"]
+        assert all(e["critical"] is True and e["outcome"] == "invoked" for e in revokes)
+        assert all(e["session_key"] == "member-scout" for e in revokes)
+        assert len(members_audit) == len(revokes)
+        # A second OFF sees only the monitor's own admission: no stale entry to
+        # revoke, no audit event, and the row remains unchanged.
+        members_audit.clear()
+        with _route_patches(svc):
+            async with TestClient(
+                TestServer(_make_app({"member-scout": _member_slot_obj()}))
+            ) as client:
+                for enabled in (False, True):
+                    resp = await client.post(
+                        f"/api/members/{CREW}/perpetual", json={"member": CREW, "enabled": enabled}
+                    )
+                    await resp.read()
+                    assert resp.status == 409
+                    assert (await resp.json())["code"] == "structured_monitor_not_convertible"
+        assert members_audit == []
+        assert svc.updates == [] and svc.added == []
+        assert dataclasses.asdict(loop) == before
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("self_armed", "party"),
+        [(False, "self"), (True, "owner")],
+    )
+    async def test_structured_monitor_off_revokes_live_id_without_matching_self_arm(
+        self,
+        quiet_authz_audit: list[dict[str, Any]],
+        trust_home: Path,
+        members_audit: list[dict[str, Any]],
+        self_armed: bool,
+        party: str,
+    ) -> None:
+        """The row bit and self party must agree before its id is preserved."""
+        loop = self._structured_monitor_row()
+        loop.self_armed = self_armed
+        if party == "self":
+            sa.record_self_arm(loop.id, "member-scout")
+            assert sa.is_recorded_self_arm(loop.id, "member-scout") is True
+        else:
+            sa.record_owner_arm(loop.id, "member-scout")
+            assert sa.is_recorded_owner_arm(loop.id, "member-scout") is True
+        before = dataclasses.asdict(loop)
+        svc = FakeLoopSvc(loop)
+        with _route_patches(svc):
+            async with TestClient(
+                TestServer(_make_app({"member-scout": _member_slot_obj()}))
+            ) as client:
+                resp = await client.post(
+                    f"/api/members/{CREW}/perpetual", json={"member": CREW, "enabled": False}
+                )
+                await resp.read()
+        assert resp.status == 409, await resp.text()
+        assert (await resp.json())["code"] == "structured_monitor_not_convertible"
+        assert sa.is_recorded_self_arm(loop.id, "member-scout") is False
+        assert sa.is_recorded_owner_arm(loop.id, "member-scout") is False
+        revokes = [e for e in members_audit if e.get("tool_name") == "perpetual_revoke"]
+        assert [e["metadata"]["loop_id"] for e in revokes] == [loop.id]
+        assert all(e["critical"] is True and e["outcome"] == "invoked" for e in revokes)
+        assert all(e["session_key"] == "member-scout" for e in revokes)
+        assert len(members_audit) == len(revokes) == 1
+        assert svc.updates == [] and svc.added == []
+        assert dataclasses.asdict(loop) == before
+
+    @pytest.mark.asyncio
+    async def test_structured_monitor_off_refuses_unreadable_live_party_before_revoke(
+        self,
+        quiet_authz_audit: list[dict[str, Any]],
+        trust_home: Path,
+        members_audit: list[dict[str, Any]],
+    ) -> None:
+        """An indeterminate live party cannot choose which admission survives."""
+        loop = self._structured_monitor_row()
+        loop.self_armed = True
+        sa.record_self_arm(loop.id, "member-scout")
+        before = dataclasses.asdict(loop)
+        svc = FakeLoopSvc(loop)
+        with (
+            _route_patches(svc),
+            patch(
+                "kiro_crew.autonudge_selfarm.read_arm_party_strict",
+                side_effect=OSError("disk"),
+            ),
+            patch("kiro_crew.autonudge_selfarm.revoke_arm_if_slot") as revoke,
+        ):
+            async with TestClient(
+                TestServer(_make_app({"member-scout": _member_slot_obj()}))
+            ) as client:
+                resp = await client.post(
+                    f"/api/members/{CREW}/perpetual", json={"member": CREW, "enabled": False}
+                )
+                await resp.read()
+        assert resp.status == 503
+        assert (await resp.json())["code"] == "perpetual_off_failed"
+        assert revoke.call_count == 0
+        assert sa.is_recorded_self_arm(loop.id, "member-scout") is True
+        assert members_audit == []
+        assert svc.updates == [] and svc.added == []
+        assert dataclasses.asdict(loop) == before
+
+    @pytest.mark.asyncio
+    async def test_structured_monitor_off_keeps_a_refused_revoke_fail_closed(
+        self,
+        quiet_authz_audit: list[dict[str, Any]],
+        trust_home: Path,
+        members_audit: list[dict[str, Any]],
+    ) -> None:
+        """The same AUDIT-OR-DENY contract as the no-row path, on a slot a
+        structured monitor holds: a revoke the record refuses is a 503, never
+        the 409 (which would read as "nothing of yours left to revoke"); an
+        unavailable audit sink refuses the revoke before it is tried; an
+        unreadable record refuses OFF before anything is touched. In every case
+        the entry stands, the switch says so, and the monitor row is unchanged."""
+        sa.record_owner_arm("gone0006", "member-scout")
+        loop = self._structured_monitor_row()
+        before = dataclasses.asdict(loop)
+        svc = FakeLoopSvc(loop)
+        with (
+            _route_patches(svc),
+            patch("kiro_crew.autonudge_selfarm.revoke_arm_if_slot", side_effect=OSError("disk")),
+        ):
+            async with TestClient(
+                TestServer(_make_app({"member-scout": _member_slot_obj()}))
+            ) as client:
+                resp = await client.post(
+                    f"/api/members/{CREW}/perpetual", json={"member": CREW, "enabled": False}
+                )
+                await resp.read()
+        assert resp.status == 503
+        assert (await resp.json())["code"] == "perpetual_off_failed"
+        assert sa.is_recorded_owner_arm("gone0006", "member-scout") is True
+        # The audit was written before the revoke was tried, and it is the
+        # only thing the members sink saw.
+        assert [e["tool_name"] for e in members_audit] == ["perpetual_revoke"]
+        assert svc.updates == [] and svc.added == []
+        assert dataclasses.asdict(loop) == before
+
+        members_audit.clear()
+
+        def _no_sel() -> Any:
+            raise OSError("sel down")
+
+        with (
+            _route_patches(svc),
+            patch("kiro_crew.dashboard.handlers.members._sel", _no_sel),
+            patch("kiro_crew.autonudge_selfarm.revoke_arm_if_slot") as revoke,
+        ):
+            async with TestClient(
+                TestServer(_make_app({"member-scout": _member_slot_obj()}))
+            ) as client:
+                resp = await client.post(
+                    f"/api/members/{CREW}/perpetual", json={"member": CREW, "enabled": False}
+                )
+                await resp.read()
+        assert resp.status == 503
+        assert (await resp.json())["code"] == "perpetual_off_failed"
+        assert revoke.call_count == 0
+        assert sa.is_recorded_owner_arm("gone0006", "member-scout") is True
+        assert svc.updates == [] and svc.added == []
+
+        # INDETERMINATE record: OFF refuses before the monitor question is
+        # even reached, and nothing is revoked or written.
+        self._corrupt_trust_record()
+        with (
+            _route_patches(svc),
+            patch("kiro_crew.autonudge_selfarm.revoke_arm_if_slot") as revoke,
+        ):
+            async with TestClient(
+                TestServer(_make_app({"member-scout": _member_slot_obj()}))
+            ) as client:
+                resp = await client.post(
+                    f"/api/members/{CREW}/perpetual", json={"member": CREW, "enabled": False}
+                )
+                await resp.read()
+        assert resp.status == 503
+        assert (await resp.json())["code"] == "perpetual_off_failed"
+        assert revoke.call_count == 0
+        assert svc.updates == [] and svc.added == []
+        assert dataclasses.asdict(loop) == before
 
     @pytest.mark.asyncio
     async def test_thread_not_open_is_409_and_slot_key_never_comes_from_the_body(
@@ -2834,16 +3168,26 @@ class TestMemberDirectivesOnPerpetualLoop:
         loop = self._loop(self_armed=True)
         sa.record_self_arm(loop.id, loop.slot_key)
         svc = FakeLoopSvc(loop)
-        removed: list[str] = []
+        removed: list[tuple[str, str, str]] = []
+        on_absent_callbacks: list[Any] = []
 
-        async def _remove(loop_id: str, *, stop_reason: str = "", stop_detail: str = "") -> None:
-            removed.append(loop_id)
+        async def _remove(
+            loop_id: str,
+            *,
+            stop_reason: str = "",
+            stop_detail: str = "",
+            on_absent: Any = None,
+        ) -> bool:
+            removed.append((loop_id, stop_reason, stop_detail))
+            on_absent_callbacks.append(on_absent)
+            return True
 
         svc.remove = _remove  # type: ignore[attr-defined]
         slot = SimpleNamespace(mode="member", _app="")
         with patch("kiro_crew.autonudge.get_instance", return_value=svc):
-            await sda._autonudge_stop(slot, "dashboard:member-scout", {})
-        assert removed == [loop.id]
+            await sda._autonudge_stop(slot, "dashboard:member-scout", {"reason": "done"})
+        assert removed == [(loop.id, sda.AUTONUDGE_STOP_REASON, "done")]
+        assert len(on_absent_callbacks) == 1 and callable(on_absent_callbacks[0])
 
 
 # ── (f) ownership checks, takeover, fail-closed reads, stop detail ──────────
@@ -3239,15 +3583,25 @@ class TestIndeterminateTrustRead:
         loop = NudgeLoop(id="chat0001", slot_key="chat-1-1", message="m", idle_secs=60)
         svc = FakeLoopSvc(loop)
         removed: list[str] = []
+        on_absent_callbacks: list[Any] = []
 
-        async def _remove(loop_id: str, *, stop_reason: str = "", stop_detail: str = "") -> None:
+        async def _remove(
+            loop_id: str,
+            *,
+            stop_reason: str = "",
+            stop_detail: str = "",
+            on_absent: Any = None,
+        ) -> bool:
             removed.append(loop_id)
+            on_absent_callbacks.append(on_absent)
+            return True
 
         svc.remove = _remove  # type: ignore[attr-defined]
         plain = SimpleNamespace(mode="", _app="")
         with patch("kiro_crew.autonudge.get_instance", return_value=svc):
             await sda._autonudge_stop(plain, "dashboard:chat-1-1", {})
         assert removed == ["chat0001"]
+        assert len(on_absent_callbacks) == 1 and callable(on_absent_callbacks[0])
 
 
 class TestStoppedDetailField:
@@ -3449,6 +3803,8 @@ class TestTakeoverTransaction:
         loop.active = True
         sa.record_self_arm(loop.id, loop.slot_key)
         svc = FakeLoopSvc(loop)
+        sibling = sa.begin_owner_arm_takeover("sib00061", "member-other", "")
+        real_settle = sa.settle_owner_arm_takeover
 
         def _raise(*_args: Any, **_kwargs: Any) -> bool:
             raise OSError("record unavailable")
@@ -3460,12 +3816,17 @@ class TestTakeoverTransaction:
         )
 
         assert resumed is None
-        assert error == "owner authorization transaction changed before commit"
+        assert error == (
+            "owner authorization could not be written — the crewmate's standing wake was stopped"
+        )
         assert status == 503
         assert loop.active is False
         assert loop.max_cycles == 0 and loop.max_runtime_secs == 0
         assert [update.get("active") for update in svc.updates] == [True, False]
-        assert sa.read_arm_party_strict(loop.id, loop.slot_key) == ""
+        assert sa.read_arm_party_strict(loop.id, loop.slot_key) == "self"
+        assert sa.read_arm_party_strict(sibling.loop_id, sibling.slot_key) == ""
+        assert real_settle(sibling, commit=False) is True
+        assert sa.read_arm_party_strict(sibling.loop_id, sibling.slot_key) == ""
 
     @pytest.mark.asyncio
     async def test_critical_audit_failure_leaves_prior_party_and_loop_unchanged(
@@ -4173,6 +4534,27 @@ class TestOwnerArmRemovalBoundary:
         )
 
     @pytest.mark.asyncio
+    async def test_non_member_removal_ignores_an_unreadable_owner_record(
+        self, trust_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        loop = NudgeLoop(
+            id="rmplain1",
+            slot_key="chat-ordinary",
+            message="ordinary",
+            idle_secs=60,
+        )
+        path = sa.self_arm_record_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json", encoding="utf-8")
+        svc = self._service(tmp_path, loop, monkeypatch)
+        try:
+            assert await svc.remove(loop.id) is True
+            assert svc.get_by_id(loop.id) is None
+            assert path.read_text(encoding="utf-8") == "{not json"
+        finally:
+            svc.stop()
+
+    @pytest.mark.asyncio
     async def test_revoke_failure_keeps_the_loop_and_fails_removal(
         self, trust_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -4349,6 +4731,138 @@ class TestOwnerArmRemovalBoundary:
             reloaded._load()
             persisted = reloaded.get_by_slot(loop.slot_key)
             assert persisted is not None and persisted.id == "replacement"
+        finally:
+            release.set()
+            svc.stop()
+
+    @pytest.mark.asyncio
+    async def test_finalize_conflict_freezes_replacement_for_recovery(
+        self, trust_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.autonudge import MonitorUpdateConflict
+
+        prior = self._loop("rmown006")
+        sa.record_owner_arm(prior.id, prior.slot_key)
+        svc = self._service(tmp_path, prior, monkeypatch)
+
+        async def _fail_finalize(_revocation: Any) -> bool:
+            raise MonitorUpdateConflict("owner admission changed")
+
+        monkeypatch.setattr(svc, "_commit_owner_revocation", _fail_finalize)
+        try:
+            with pytest.raises(MonitorUpdateConflict, match="owner admission changed"):
+                await svc.add(
+                    prior.slot_key,
+                    "replacement",
+                    idle_secs=3600,
+                    max_cycles=0,
+                    stop_sentinel_path="",
+                    loop_id="replacement",
+                )
+
+            replacement = svc.get_by_slot(prior.slot_key)
+            assert replacement is not None and replacement.id == "replacement"
+            assert replacement.active is True
+            assert replacement.id not in svc._timers
+            assert replacement.id in svc._deferred_monitor_replacements
+            with pytest.raises(MonitorUpdateConflict, match="still being finalized"):
+                await svc.update(replacement.id, active=False)
+            svc._reconcile_once()
+            svc._reconcile_once()
+            assert replacement.id not in svc._timers
+            assert replacement.id not in svc._reconcile_candidates
+            with pytest.raises(OSError, match="revocation is in progress"):
+                sa.recorded_arm_ids_for_slot_strict(prior.slot_key)
+        finally:
+            svc.stop()
+
+    @pytest.mark.asyncio
+    async def test_finalize_io_failure_rolls_back_before_reporting_error(
+        self, trust_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        prior = self._loop("rmown007")
+        sa.record_owner_arm(prior.id, prior.slot_key)
+        svc = self._service(tmp_path, prior, monkeypatch)
+        real_finalize = svc._commit_owner_revocation
+        attempts = 0
+
+        async def _fail_once(revocation: Any) -> bool:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("record unavailable")
+            return await real_finalize(revocation)
+
+        monkeypatch.setattr(svc, "_commit_owner_revocation", _fail_once)
+        try:
+            with pytest.raises(OSError, match="record unavailable"):
+                await svc.add(
+                    prior.slot_key,
+                    "replacement",
+                    idle_secs=3600,
+                    max_cycles=0,
+                    stop_sentinel_path="",
+                    loop_id="replacement",
+                )
+
+            assert attempts == 2
+            assert svc.get_by_slot(prior.slot_key) is prior
+            assert svc.get_by_id("replacement") is None
+            assert not svc._deferred_monitor_replacements
+            assert sa.is_recorded_owner_arm(prior.id, prior.slot_key) is True
+        finally:
+            svc.stop()
+
+    @pytest.mark.asyncio
+    async def test_finalize_failure_preserves_store_write_cancellation(
+        self, trust_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+        import threading
+
+        from kiro_crew.autonudge import MonitorUpdateConflict
+
+        prior = self._loop("rmown008")
+        sa.record_owner_arm(prior.id, prior.slot_key)
+        svc = self._service(tmp_path, prior, monkeypatch)
+        original_write = svc._write_state
+        committed = threading.Event()
+        release = threading.Event()
+
+        def _commit_then_park(payload: dict[str, Any]) -> None:
+            original_write(payload)
+            if any(row.get("id") == "replacement" for row in payload["loops"]):
+                committed.set()
+                release.wait(timeout=10)
+
+        async def _fail_finalize(_revocation: Any) -> bool:
+            raise MonitorUpdateConflict("owner admission changed")
+
+        monkeypatch.setattr(svc, "_write_state", _commit_then_park)
+        monkeypatch.setattr(svc, "_commit_owner_revocation", _fail_finalize)
+        replacement_task = asyncio.create_task(
+            svc.add(
+                prior.slot_key,
+                "replacement",
+                idle_secs=3600,
+                max_cycles=0,
+                stop_sentinel_path="",
+                loop_id="replacement",
+            )
+        )
+        try:
+            assert await asyncio.to_thread(committed.wait, 2)
+            replacement_task.cancel()
+            await asyncio.sleep(0.02)
+            assert not replacement_task.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await replacement_task
+
+            replacement = svc.get_by_slot(prior.slot_key)
+            assert replacement is not None and replacement.active is True
+            assert replacement.id not in svc._timers
+            assert replacement.id in svc._deferred_monitor_replacements
         finally:
             release.set()
             svc.stop()
@@ -5690,6 +6204,423 @@ class TestAuthorizerOwnerWriteIsJoined:
             await await_thread_to_completion(_work)
 
 
+class TestSharedDeferredCancellationJoin:
+    """One shielded join loop, ``sa.drain_future_deferring_cancellation``, sits
+    behind the thread join above, the service's future join and the authorizer's
+    transaction steps. The thread join's contract is pinned by the tests above;
+    these pin the loop itself and the two readings of its answer that differ."""
+
+    @pytest.mark.asyncio
+    async def test_the_drain_absorbs_repeated_cancels_and_reports_one(self) -> None:
+        import asyncio
+
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(sa.drain_future_deferring_cancellation(fut))
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()  # the drain's forced second cancel
+        await asyncio.sleep(0)
+        assert not task.done()  # still joining: neither cancel abandoned the future
+        fut.set_result("landed")
+        assert await task is True
+        assert fut.result() == "landed"  # the outcome is left for the caller to read
+
+    @pytest.mark.asyncio
+    async def test_the_drain_never_raises_the_futures_own_error(self) -> None:
+        import asyncio
+
+        release = asyncio.Event()
+
+        async def _fail() -> None:
+            await release.wait()
+            raise OSError("disk full")
+
+        inner = asyncio.create_task(_fail())
+        task = asyncio.create_task(sa.drain_future_deferring_cancellation(inner))
+        await asyncio.sleep(0)
+        release.set()
+        assert await task is False  # no cancel arrived; the error stays in the future
+        with pytest.raises(OSError):
+            inner.result()
+        settled: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        settled.set_result("done")
+        assert await sa.drain_future_deferring_cancellation(settled) is False
+
+    @staticmethod
+    async def _joined(task: Any, *pending: Any) -> Any:
+        """Read *task*'s outcome within a bound, never by cancelling it: the
+        drain absorbs cancels, so a cancelling wait on a hung drain would hang
+        too. A drain still joining when the bound expires is failed and its
+        futures settled so the loop can end."""
+        import asyncio
+
+        done, _ = await asyncio.wait({task}, timeout=2)
+        if not done:
+            for fut in pending:
+                if not fut.done():
+                    fut.cancel()
+            await asyncio.wait({task}, timeout=2)
+            pytest.fail("the drain did not settle within the bound")
+        return task.result()
+
+    @pytest.mark.asyncio
+    async def test_the_drain_does_not_read_the_futures_own_cancel_as_the_callers(
+        self,
+    ) -> None:
+        """The shield reports an externally cancelled inner future as a
+        ``CancelledError`` too; that is the future settling, not a cancel of
+        the caller, so the drain returns False and leaves the cancellation in
+        the future for the caller to read."""
+        import asyncio
+
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(sa.drain_future_deferring_cancellation(fut))
+        await asyncio.sleep(0)
+        fut.cancel()
+        assert await self._joined(task, fut) is False
+        assert fut.cancelled()
+
+        # The same through a task, whose cancellation lands only once it unwinds.
+        inner = asyncio.create_task(asyncio.Event().wait())
+        task = asyncio.create_task(sa.drain_future_deferring_cancellation(inner))
+        await asyncio.sleep(0)
+        inner.cancel()
+        assert await self._joined(task, inner) is False
+        assert inner.cancelled()
+
+        # A caller cancel that arrived earlier is still reported when the
+        # future later settles by its own cancellation.
+        late: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(sa.drain_future_deferring_cancellation(late))
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        late.cancel()
+        assert await self._joined(task, late) is True
+        assert late.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_the_drain_still_reports_a_cancel_racing_the_futures_completion(
+        self,
+    ) -> None:
+        """The caller is cancelled in the same tick the (uncancelled) future
+        completes: the shield drops the value it was about to deliver and
+        raises ``CancelledError`` over a done, uncancelled future. That one is
+        the caller's cancel and is recorded."""
+        import asyncio
+
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(sa.drain_future_deferring_cancellation(fut))
+        await asyncio.sleep(0)
+        fut.set_result("landed")
+        task.cancel()  # before the shield's inner-done callback has run
+        assert await self._joined(task, fut) is True
+        assert fut.result() == "landed"
+
+    @pytest.mark.asyncio
+    async def test_the_drain_keeps_the_callers_cancel_when_it_collides_with_the_futures(
+        self,
+    ) -> None:
+        """The future is cancelled AND the caller is cancelled in the same tick,
+        before the drain resumes: the shield raises one ``CancelledError`` for
+        both, so ``fut.cancelled()`` alone would read it as the future's and
+        drop the caller's. The rise in the task's ``cancelling()`` count is the
+        caller's cancel, and it is reported -- in either order, and through a
+        task whose cancellation lands only once it unwinds. An inner-only
+        cancel still reads False (pinned above), so the count is the whole of
+        the difference."""
+        import asyncio
+
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(sa.drain_future_deferring_cancellation(fut))
+        await asyncio.sleep(0)
+        fut.cancel()
+        task.cancel()
+        assert await self._joined(task, fut) is True
+        assert fut.cancelled()
+
+        other: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(sa.drain_future_deferring_cancellation(other))
+        await asyncio.sleep(0)
+        task.cancel()
+        other.cancel()
+        assert await self._joined(task, other) is True
+        assert other.cancelled()
+
+        inner = asyncio.create_task(asyncio.Event().wait())
+        task = asyncio.create_task(sa.drain_future_deferring_cancellation(inner))
+        await asyncio.sleep(0)
+        inner.cancel()
+        task.cancel()
+        assert await self._joined(task, inner) is True
+        assert inner.cancelled()
+
+        # The transaction step keeps all three parts: the future's own
+        # cancellation is its error, and the caller's cancel is still True.
+        step: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        step_task = asyncio.create_task(autonudge_authz._await_transaction_step(step))
+        await asyncio.sleep(0)
+        step.cancel()
+        step_task.cancel()
+        result, error, cancelled = await self._joined(step_task, step)
+        assert result is None and isinstance(error, asyncio.CancelledError) and cancelled is True
+
+    @pytest.mark.asyncio
+    async def test_the_drain_does_not_read_a_stored_cancelled_error_as_the_callers(
+        self,
+    ) -> None:
+        """A future may be done, not cancelled, and hold a ``CancelledError``
+        set through ``set_exception``. The shield raises that very object, so
+        the drain would otherwise count it as the caller's cancel; identity
+        with the future's stored exception tells it apart, and the error is
+        left in the future for the caller to read with its own precedence."""
+        import asyncio
+
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(sa.drain_future_deferring_cancellation(fut))
+        await asyncio.sleep(0)
+        stored = asyncio.CancelledError("stored by the worker")
+        fut.set_exception(stored)
+        assert await self._joined(task, fut) is False
+        assert not fut.cancelled() and fut.exception() is stored
+
+        # The joins read it as the future's error: raised as-is when no cancel
+        # arrived, kept as the error part of an uncancelled transaction step.
+        with pytest.raises(asyncio.CancelledError) as info:
+            await sa.await_future_deferring_cancellation(fut)
+        assert info.value is stored
+        assert await autonudge_authz._await_transaction_step(fut) == (None, stored, False)
+
+        # A caller cancel racing that settle is still the caller's: the object
+        # the shield raises is then not the one the future stores.
+        raced: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(sa.drain_future_deferring_cancellation(raced))
+        await asyncio.sleep(0)
+        raced.set_exception(asyncio.CancelledError("stored by the worker"))
+        task.cancel()
+        assert await self._joined(task, raced) is True
+        assert not raced.cancelled()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+    async def test_the_drain_propagates_an_unrelated_base_exception_over_a_settled_future(
+        self, interrupt: type[BaseException]
+    ) -> None:
+        """``KeyboardInterrupt`` / ``SystemExit`` reach the waiting drain in the
+        same tick the future settles: ``fut.done()`` is already True, but the
+        interrupt is not the future's stored outcome and must not be absorbed
+        into a False behind the landed value. Driven by hand so the interrupt
+        never crosses a task boundary, where the event loop would re-raise it."""
+        import asyncio
+
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        coro = sa.drain_future_deferring_cancellation(fut)
+        coro.send(None)  # suspend at the shield
+        fut.set_result("landed")  # settles before the wakeup runs
+        with pytest.raises(interrupt):
+            coro.throw(interrupt())
+        assert fut.result() == "landed"  # the outcome is left, not consumed
+
+    @pytest.mark.asyncio
+    async def test_the_drain_propagates_a_runtime_base_exception_over_a_settled_future(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The runtime error inside the shield lands as the future settles;
+        the settled value does not make it the future's outcome. The fake
+        shield settles the future and raises exactly once, then defers to the
+        real one, so no implementation can turn it into a busy loop."""
+        import asyncio
+
+        class _Teardown(BaseException):
+            pass
+
+        real_shield = asyncio.shield
+        raised: list[int] = []
+
+        def _shield_once(arg: Any) -> Any:
+            if not raised:
+                raised.append(1)
+                arg.set_result("landed")
+                raise _Teardown("shield failed as the future settled")
+            return real_shield(arg)
+
+        monkeypatch.setattr(asyncio, "shield", _shield_once)
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(sa.drain_future_deferring_cancellation(fut))
+        done, _ = await asyncio.wait({task}, timeout=2)
+        assert done, "the drain did not settle within the bound"
+        with pytest.raises(_Teardown):
+            task.result()
+        assert fut.result() == "landed"
+
+    @pytest.mark.asyncio
+    async def test_the_drain_propagates_a_runtime_base_exception_while_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``BaseException`` that is neither a cancel nor the future's own
+        error, raised while the future is still pending, is not swallowed
+        into a False that would tell the caller a pending future has settled.
+        The fake shield raises exactly once and then defers to the real one,
+        so no implementation can turn it into a busy loop."""
+        import asyncio
+
+        class _Teardown(BaseException):
+            pass
+
+        real_shield = asyncio.shield
+        raised: list[int] = []
+
+        def _shield_once(arg: Any) -> Any:
+            if not raised:
+                raised.append(1)
+                raise _Teardown("shield failed")
+            return real_shield(arg)
+
+        monkeypatch.setattr(asyncio, "shield", _shield_once)
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(sa.drain_future_deferring_cancellation(fut))
+        done, _ = await asyncio.wait({task}, timeout=2)
+        if not done:
+            fut.cancel()
+            await asyncio.wait({task}, timeout=2)
+            pytest.fail("the drain absorbed a runtime BaseException over a pending future")
+        with pytest.raises(_Teardown):
+            task.result()
+        assert not fut.done()  # the future was never settled by the drain
+        fut.cancel()
+
+    @pytest.mark.asyncio
+    async def test_the_drain_honours_generator_exit_on_teardown(self) -> None:
+        """``coroutine.close()`` throws ``GeneratorExit`` at the pending
+        shield; the drain must let it out rather than return, which would
+        make ``close()`` raise ``RuntimeError('coroutine ignored
+        GeneratorExit')`` and leave the pending future undrained."""
+        import asyncio
+
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        coro = sa.drain_future_deferring_cancellation(fut)
+        coro.send(None)  # suspend at the shield
+        coro.close()  # raises RuntimeError if GeneratorExit was swallowed
+        assert not fut.done()
+        fut.cancel()
+
+    @pytest.mark.asyncio
+    async def test_the_future_join_lets_cancellation_win_and_chains_the_error(self) -> None:
+        import asyncio
+
+        release = asyncio.Event()
+
+        async def _fail() -> None:
+            await release.wait()
+            raise OSError("disk full")
+
+        inner = asyncio.create_task(_fail())
+        task = asyncio.create_task(sa.await_future_deferring_cancellation(inner))
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as info:
+            await task
+        assert isinstance(info.value.__cause__, OSError)
+        # Uncancelled, the future's error is the caller's to see.
+        with pytest.raises(OSError):
+            await sa.await_future_deferring_cancellation(asyncio.create_task(_fail()))
+
+    @pytest.mark.asyncio
+    async def test_the_future_join_observes_a_cancel_requested_before_it_began(self) -> None:
+        """The future is settled before the join, so the loop never runs; the
+        cancel is seen through ``Task.cancelling()`` alone."""
+        import asyncio
+
+        seen: list[tuple[str, bool]] = []
+
+        async def _body() -> None:
+            fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+            fut.set_result("landed")
+            me = asyncio.current_task()
+            assert me is not None
+            me.cancel()
+            seen.append(await sa.await_future_deferring_cancellation(fut))
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.create_task(_body())
+        assert seen == [("landed", True)]
+
+    @pytest.mark.asyncio
+    async def test_the_service_spelling_is_the_same_join(self) -> None:
+        import asyncio
+
+        from kiro_crew.autonudge_service import maintenance
+
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        fut.set_result("landed")
+        assert await maintenance._await_future_deferring_cancellation(fut) == ("landed", False)
+
+        async def _fail() -> None:
+            raise OSError("disk full")
+
+        with pytest.raises(OSError):
+            await maintenance._await_future_deferring_cancellation(asyncio.create_task(_fail()))
+
+    @pytest.mark.asyncio
+    async def test_a_transaction_step_keeps_its_result_beside_the_cancel(self) -> None:
+        import asyncio
+
+        release = asyncio.Event()
+
+        async def _commit() -> str:
+            await release.wait()
+            return "committed"
+
+        task = asyncio.create_task(
+            autonudge_authz._await_transaction_step(asyncio.create_task(_commit()))
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        assert await task == ("committed", None, True)
+
+        async def _fail() -> None:
+            raise OSError("disk full")
+
+        result, error, cancelled = await autonudge_authz._await_transaction_step(
+            asyncio.create_task(_fail())
+        )
+        assert result is None and isinstance(error, OSError) and cancelled is False
+
+    @pytest.mark.asyncio
+    async def test_settle_after_cancel_never_abandons_the_add_and_drops_its_error(self) -> None:
+        import asyncio
+
+        release = asyncio.Event()
+        finished: list[str] = []
+
+        async def _add() -> None:
+            await release.wait()
+            finished.append("done")
+            raise OSError("late failure")
+
+        task = asyncio.create_task(
+            autonudge_authz._settle_after_cancel(asyncio.create_task(_add()))
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done() and finished == []  # still waiting on the add
+        release.set()
+        assert await task is None  # the add's own error is not this cancel's
+        assert finished == ["done"]
+        assert await autonudge_authz._settle_after_cancel(None) is None
+
+
 class TestRosterPerpetualReading:
     """``GET /api/members`` carries ``perpetual`` per row, read from the live
     registry: on / off / none, so the roster and the team view can show a
@@ -5700,12 +6631,19 @@ class TestRosterPerpetualReading:
     def _svc(loop: NudgeLoop | None) -> Any:
         return SimpleNamespace(get_by_slot=lambda slot_key: loop)
 
-    def test_admitted_active_loop_reads_on(self, trust_home: Path) -> None:
+    def test_owner_active_uncapped_loop_reads_on(self, trust_home: Path) -> None:
         from kiro_crew.dashboard.handlers.members import perpetual_state_of
 
         loop = NudgeLoop(id="ro000001", slot_key="member-scout", message="m", idle_secs=60)
-        sa.record_self_arm(loop.id, loop.slot_key)
+        sa.record_owner_arm(loop.id, loop.slot_key)
         assert perpetual_state_of(self._svc(loop), "member-scout") == "on"
+
+    def test_self_active_uncapped_loop_reads_none(self, trust_home: Path) -> None:
+        from kiro_crew.dashboard.handlers.members import perpetual_state_of
+
+        loop = NudgeLoop(id="ro000009", slot_key="member-scout", message="m", idle_secs=60)
+        sa.record_self_arm(loop.id, loop.slot_key)
+        assert perpetual_state_of(self._svc(loop), "member-scout") == "none"
 
     def test_preloaded_parties_keep_roster_rows_in_memory(
         self, monkeypatch: pytest.MonkeyPatch
@@ -5755,6 +6693,53 @@ class TestRosterPerpetualReading:
         with patch("kiro_crew.autonudge.is_structured_monitor_loop", return_value=True):
             assert perpetual_state_of(self._svc(loop), "member-scout") == "none"
 
+    @pytest.mark.parametrize(
+        ("max_cycles", "max_runtime_secs"),
+        [(24, 0), (0, 3600), (24, 3600)],
+        ids=["cycle-cap", "runtime-cap", "both-caps"],
+    )
+    def test_active_capped_loop_reads_none_before_its_party(
+        self, monkeypatch: pytest.MonkeyPatch, max_cycles: int, max_runtime_secs: int
+    ) -> None:
+        """A finite loop is a monitor, not Perpetual mode: it reads ``none`` so the
+        switch stays available for the ON route to take over and clear both caps,
+        and the cap check runs BEFORE the arm party is consulted -- no trust-record
+        read happens for a capped row, whether preloaded or per-row."""
+        from kiro_crew.dashboard.handlers.members import perpetual_state_of
+
+        loop = NudgeLoop(
+            id="ro000007",
+            slot_key="member-scout",
+            message="m",
+            idle_secs=60,
+            max_cycles=max_cycles,
+            max_runtime_secs=max_runtime_secs,
+        )
+
+        def _unexpected_read(loop_id: str, slot_key: str) -> str:
+            raise AssertionError("capped loop consulted its arm party")
+
+        monkeypatch.setattr(sa, "read_arm_party_strict", _unexpected_read)
+        assert perpetual_state_of(self._svc(loop), "member-scout") == "none"
+        admitted = {("ro000007", "member-scout"): "owner"}
+        assert perpetual_state_of(self._svc(loop), "member-scout", arm_parties=admitted) == "none"
+
+    def test_paused_capped_loop_still_reads_off(self) -> None:
+        """The cap rule is for ACTIVE loops only: a paused finite loop keeps its
+        ``off`` reading, because the ON route resumes THAT loop and lifts its caps."""
+        from kiro_crew.dashboard.handlers.members import perpetual_state_of
+
+        loop = NudgeLoop(
+            id="ro000008",
+            slot_key="member-scout",
+            message="m",
+            idle_secs=60,
+            max_cycles=24,
+            active=False,
+            stopped_reason="manual",
+        )
+        assert perpetual_state_of(self._svc(loop), "member-scout") == "off"
+
 
 # ── (h) the record's own masked leaf ────────────────────────────────────────
 
@@ -5800,20 +6785,23 @@ class TestArmRecordLeaf:
         exception, which is why the record is not under it.
 
         The mask that holds the record is the HOST's: a whole-directory stand-in
-        pre-created before every spawn. The record's own nested leaf is listed so
-        the launcher payload names the path and ``test_sandbox_protected_name_holds``
-        can pin the ancestor hold (``HELD_BY_ENCLOSING_MASK``); it is NOT
-        pre-created (the materialiser refuses intermediate directories, and an
-        absent child of a masked host is invisible either way) and NOT in
-        ``_CREW_NO_ALIAS_LEAVES`` (a link at the host refuses the spawn as every
-        masked leaf does). A root-level ``autonudge-trust`` leaf must never come
-        back: it would be held only at spawn.
+        pre-created before every spawn. The record's nested path is NOT listed as
+        a hidden leaf of its own: the host's stand-in already holds it, and a
+        launcher that pins carried occupant identities refuses a spawn on a
+        nested leaf once it exists (the host's mask leaves the child's name
+        absent at pin time -- ``test_sandbox_protected_name_holds`` pins the
+        no-nesting rule). It is NOT pre-created (the materialiser refuses
+        intermediate directories, and an absent child of a masked host is
+        invisible either way) and NOT in ``_CREW_NO_ALIAS_LEAVES`` (a link at
+        the host refuses the spawn as every masked leaf does). A root-level
+        ``autonudge-trust`` leaf must never come back: it would be held only at
+        spawn.
         """
         from kiro_crew import sandbox
 
         assert sa.ARM_RECORD_HOST_DIRNAME in sandbox._CREW_HIDDEN_LEAVES
         assert sa.ARM_RECORD_HOST_DIRNAME in sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES
-        assert sa.ARM_RECORD_LEAF in sandbox._CREW_HIDDEN_LEAVES
+        assert sa.ARM_RECORD_LEAF not in sandbox._CREW_HIDDEN_LEAVES
         assert sa.ARM_RECORD_DIRNAME not in sandbox._CREW_HIDDEN_LEAVES
         assert sa.ARM_RECORD_DIRNAME not in sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES
         assert sa.ARM_RECORD_LEAF not in sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES
@@ -5933,17 +6921,36 @@ class TestLegacyRecordRetirement:
         self, trust_home: Path, monkeypatch: pytest.MonkeyPatch, caplog: Any
     ) -> None:
         self._legacy(trust_home, {"old00001": {"slot_key": "member-scout", "armed_ts": 1.0}})
-        real_unlink = Path.unlink
+        real_unlink = os.unlink
 
-        def _refuse(self: Path, *args: Any, **kwargs: Any) -> None:
-            if self.name == sa.SELF_ARM_RECORD_NAME:
+        def _refuse(path: Any, *args: Any, **kwargs: Any) -> None:
+            if Path(path).name == sa.SELF_ARM_RECORD_NAME:
                 raise OSError("busy")
-            real_unlink(self, *args, **kwargs)
+            real_unlink(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "unlink", _refuse)
+        monkeypatch.setattr(os, "unlink", _refuse)
         with caplog.at_level(logging.WARNING, logger="kiro_crew.autonudge_selfarm"):
             assert sa.is_recorded_self_arm("old00001", "member-scout") is False
         assert any("could not discard" in rec.message for rec in caplog.records)
+
+    def test_a_linked_legacy_directory_cannot_delete_the_live_record(
+        self, trust_home: Path
+    ) -> None:
+        sa.record_owner_arm("live0001", "member-a")
+        sa.record_self_arm("live0002", "member-b")
+        live_dir = sa.self_arm_record_path().parent
+        legacy_dir = trust_home / sa._LEGACY_DIRNAME
+        if legacy_dir.exists():
+            shutil.rmtree(legacy_dir)
+        platform_compat.symlink_or_junction(live_dir, legacy_dir)
+        try:
+            sa.record_self_arm("live0003", "member-c")
+            assert sa.is_recorded_owner_arm("live0001", "member-a") is True
+            assert sa.is_recorded_self_arm("live0002", "member-b") is True
+            assert sa.is_recorded_self_arm("live0003", "member-c") is True
+            assert (live_dir / sa._LOCK_NAME).exists()
+        finally:
+            platform_compat.unlink_link_or_junction(legacy_dir)
 
     def test_no_legacy_file_is_a_no_op(self, trust_home: Path) -> None:
         sa._retire_legacy_record()

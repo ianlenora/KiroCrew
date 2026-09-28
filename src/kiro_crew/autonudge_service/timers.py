@@ -548,6 +548,8 @@ def _reconcile_once(self: AutoNudgeService) -> None:
         return
     eligible: set[str] = set()
     for loop in list(self._loops.values()):
+        if loop.id in self._deferred_monitor_replacements:
+            continue
         # Mirror _timer's own re-arm guard, not a stricter one: an
         # INACTIVE loop still waiting for terminal-completion evidence
         # owns a finite accepted-turn correlation whose expiry needs a

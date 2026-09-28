@@ -173,6 +173,11 @@ def _serialize_monitor(loop: Any) -> dict[str, Any]:
 #:   owner-scoped text through a field that looks innocuous.
 #: * ``banner`` -- the same class of agent-authored display text, and a monitor
 #:   has no banner to describe.
+#: * ``stopped_detail`` -- the one free-text field a stop carries, written by the
+#:   member's own stop and re-normalised on every plain-loop projection. Same
+#:   class as ``banner``: agent-authored prose, held back here as every other
+#:   free-text field on the reduced row is. ``stopped_reason`` stays: it is a
+#:   closed code from the service's own vocabulary, not text.
 #: * ``stop_sentinel_path`` -- a filesystem path, and the structured branch of
 #:   ``_timer`` returns before the sentinel is ever tested.
 #:
@@ -203,6 +208,7 @@ _MONITOR_WITHHELD_LEGACY_FIELDS = frozenset(
         "monitor",
         "message",
         "banner",
+        "stopped_detail",
         "stop_sentinel_path",
         "config_generation",
         "goal_token",
@@ -283,10 +289,10 @@ _MONITOR_MAPPED_LEGACY_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
 #: tested in one change belongs in that change. So the liveness gap is REAL and
 #: recorded, not silently filled.
 #:
-#: Consequence a reader must know: a reduced row carries no positive marker
-#: saying "this is a monitor". It is told apart by the ABSENCE of the withheld
-#: fields, which is weaker than a marker and is the other half of what the
-#: rendering change should add.
+#: A reduced row carries one positive, subject-free marker:
+#: ``record_kind="structured_monitor"``. It reveals no target, provider kind,
+#: objective or owner text; it only prevents consumers from guessing monitor
+#: identity from whichever withheld field happens to be absent.
 
 
 def _serialize_for_legacy_reader(loop: Any) -> dict[str, Any]:
@@ -323,6 +329,7 @@ def _serialize_for_legacy_reader(loop: Any) -> dict[str, Any]:
         for attr in path:
             value = getattr(value, attr)
         payload[name] = value
+    payload["record_kind"] = "structured_monitor"
     return payload
 
 

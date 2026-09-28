@@ -12,7 +12,11 @@ import pytest
 from kiro_crew import autonudge_authz
 from kiro_crew import autonudge_provider_trust as trust
 from kiro_crew import autonudge_selfarm as owner_trust
-from kiro_crew.autonudge import AutoNudgeService, MonitorUpdateConflict
+from kiro_crew.autonudge import (
+    INVALID_BOUNDS_REASON,
+    AutoNudgeService,
+    MonitorUpdateConflict,
+)
 from kiro_crew.monitoring.models import (
     MonitorBudgets,
     MonitorCreationSurface,
@@ -225,8 +229,6 @@ async def test_remove_keeps_monitor_when_durable_provider_revocation_fails(
         loop.monitor.kind,
         loop.monitor.target,
     )
-    owner_trust.record_owner_arm(loop.id, loop.slot_key, txn="exact-owner-token")
-    prior_owner_entry = owner_trust._read_record_strict_raw()[loop.id].copy()
 
     def fail_revocation(_monitor_id: str) -> None:
         raise OSError("durable revocation unavailable")
@@ -242,8 +244,6 @@ async def test_remove_keeps_monitor_when_durable_provider_revocation_fails(
     reloaded = AutoNudgeService(tmp_path / "store")
     reloaded._load()
     assert reloaded.get_by_id(loop.id) is not None
-    assert owner_trust.is_recorded_owner_arm(loop.id, loop.slot_key) is True
-    assert owner_trust._read_record_strict_raw()[loop.id] == prior_owner_entry
     assert trust.is_monitor_owner_credentials_recorded(
         loop.id,
         loop.slot_key,
@@ -833,7 +833,6 @@ async def test_request_cancellation_during_replacement_settlement_finishes_trans
     trust.record_monitor_owner_credentials(
         prior.id, prior.slot_key, prior.monitor.kind, prior.monitor.target
     )
-    owner_trust.record_owner_arm(prior.id, prior.slot_key)
     monkeypatch.setattr(
         autonudge_authz,
         "sel",
@@ -883,7 +882,6 @@ async def test_request_cancellation_during_replacement_settlement_finishes_trans
         assert replacement is not None and replacement.id != prior.id
         assert replacement.monitor is not None
         assert not svc._deferred_monitor_replacements
-        assert owner_trust.is_recorded_owner_arm(prior.id, prior.slot_key) is False
         assert trust.is_monitor_owner_credentials_recorded(
             replacement.id,
             replacement.slot_key,
@@ -917,7 +915,6 @@ async def test_request_cancellation_during_activation_joins_and_finalizes(
     trust.record_monitor_owner_credentials(
         prior.id, prior.slot_key, prior.monitor.kind, prior.monitor.target
     )
-    owner_trust.record_owner_arm(prior.id, prior.slot_key)
     monkeypatch.setattr(
         autonudge_authz,
         "sel",
@@ -965,7 +962,6 @@ async def test_request_cancellation_during_activation_joins_and_finalizes(
         with pytest.raises(asyncio.CancelledError):
             await request
         assert not svc._deferred_monitor_replacements
-        assert owner_trust.is_recorded_owner_arm(prior.id, prior.slot_key) is False
         assert trust.is_monitor_owner_credentials_recorded(
             replacement.id,
             replacement.slot_key,
@@ -999,7 +995,6 @@ async def test_update_is_refused_while_replacement_activation_is_pending(
     trust.record_monitor_owner_credentials(
         prior.id, prior.slot_key, prior.monitor.kind, prior.monitor.target
     )
-    owner_trust.record_owner_arm(prior.id, prior.slot_key, txn="exact-prior")
     monkeypatch.setattr(
         autonudge_authz,
         "sel",
@@ -1054,7 +1049,6 @@ async def test_update_is_refused_while_replacement_activation_is_pending(
         committed, error, status = await request
         assert error is None and status == 200 and committed is replacement
         assert not svc._deferred_monitor_replacements
-        assert not owner_trust.is_recorded_owner_arm(prior.id, prior.slot_key)
         assert not trust.is_monitor_owner_credentials_recorded(
             prior.id,
             prior.slot_key,
@@ -1096,7 +1090,6 @@ async def test_restart_recovers_committed_replacement_fences(tmp_path: Path) -> 
     trust.record_monitor_owner_credentials(
         prior.id, prior.slot_key, prior.monitor.kind, prior.monitor.target
     )
-    owner_trust.record_owner_arm(prior.id, prior.slot_key, txn="exact-prior")
     trust.prepare_monitor_owner_credentials(
         "replacement",
         prior.slot_key,
@@ -1119,7 +1112,6 @@ async def test_restart_recovers_committed_replacement_fences(tmp_path: Path) -> 
     )
     assert replacement.monitor is not None
     assert replacement.id in svc._deferred_monitor_replacements
-    assert owner_trust.is_recorded_owner_arm(prior.id, prior.slot_key) is False
     assert not trust.is_monitor_owner_credentials_recorded(
         replacement.id,
         replacement.slot_key,
@@ -1133,7 +1125,6 @@ async def test_restart_recovers_committed_replacement_fences(tmp_path: Path) -> 
     persisted = reloaded.get_by_slot(prior.slot_key)
     assert persisted is not None and persisted.monitor is not None
     assert persisted.id == replacement.id
-    assert owner_trust.is_recorded_owner_arm(prior.id, prior.slot_key) is False
     assert trust.is_monitor_owner_credentials_recorded(
         persisted.id,
         persisted.slot_key,
@@ -1192,7 +1183,7 @@ async def test_restart_keeps_owner_revoked_for_quarantined_same_id_row(
     reloaded._load()
 
     assert reloaded.get_by_id(loop.id) is None
-    assert any(item.get("id") == loop.id for item in reloaded._quarantined)
+    assert any(item.get("id") == loop.id for item in reloaded._store.quarantined)
     assert not owner_trust.is_recorded_owner_arm(loop.id, loop.slot_key)
 
 
@@ -1405,7 +1396,7 @@ async def test_failed_restart_activation_keeps_replacement_frozen_and_restores_p
 
 
 @pytest.mark.asyncio
-async def test_nonfinite_loop_times_are_repaired_before_trust_recovery(tmp_path: Path) -> None:
+async def test_invalid_loop_bounds_stop_before_trust_recovery(tmp_path: Path) -> None:
     svc = AutoNudgeService(tmp_path / "store")
     loop = await svc.add_monitor(
         slot_key="chat-1",
@@ -1421,7 +1412,7 @@ async def test_nonfinite_loop_times_are_repaired_before_trust_recovery(tmp_path:
     row["last_fire_ts"] = float("inf")
     row["max_cycles"] = float("nan")
     row["cycle_count"] = float("inf")
-    row["max_runtime_secs"] = float("nan")
+    row["max_runtime_secs"] = 0.5
     svc._path.write_text(json.dumps(raw), encoding="utf-8")
     svc.stop()
 
@@ -1435,8 +1426,256 @@ async def test_nonfinite_loop_times_are_repaired_before_trust_recovery(tmp_path:
     assert repaired.max_cycles == 0
     assert repaired.cycle_count == 0
     assert repaired.max_runtime_secs == 0
+    assert repaired.active is False
+    assert repaired.stopped_reason == INVALID_BOUNDS_REASON
+    assert repaired.next_due_ts == 0.0
+    assert repaired.monitor is not None
+    assert repaired.monitor.next_probe_at == 0.0
     assert reloaded._store_dirty is True
     reloaded.stop()
+
+
+def _write_legacy_row(store_dir: Path, **row: Any) -> Path:
+    """One plain (non-monitor) loop row, as ``_load`` reads it back from disk."""
+    path = store_dir / "autonudge.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    values: dict[str, Any] = {
+        "id": "b0d50001",
+        "slot_key": "chat-1",
+        "message": "go",
+        "idle_secs": 60,
+        "active": True,
+        "next_due_ts": 4_102_444_800.0,
+    }
+    values.update(row)
+    path.write_text(json.dumps({"version": 1, "loops": [values]}), encoding="utf-8")
+    return path
+
+
+def test_repaired_created_ts_against_a_finite_runtime_cap_stops_the_loop(tmp_path: Path) -> None:
+    """``created_ts`` is what ``max_runtime_secs`` is measured from: repaired to
+    zero, ``runtime_budget_exceeded`` can never trip, so the cap reads as intact
+    while the loop runs unlimited. That is an invalid bound, not a cosmetic fix."""
+    _write_legacy_row(tmp_path / "store", created_ts=float("nan"), max_runtime_secs=600)
+
+    svc = AutoNudgeService(tmp_path / "store")
+    svc._load()
+    try:
+        loop = svc.get_by_id("b0d50001")
+        assert loop is not None
+        assert loop.created_ts == 0.0
+        assert loop.max_runtime_secs == 600  # the cap itself was fine and is kept
+        assert loop.active is False
+        assert loop.stopped_reason == INVALID_BOUNDS_REASON
+        assert loop.next_due_ts == 0.0
+        assert svc._store_dirty is True
+    finally:
+        svc.stop()
+
+
+def test_repaired_cycle_count_against_a_finite_cycle_cap_stops_the_loop(tmp_path: Path) -> None:
+    """A spent-turn count that cannot be read back is a cap that restarts from
+    zero: ``max_cycles`` stays intact on the row while every turn already taken
+    against it is forgotten."""
+    _write_legacy_row(tmp_path / "store", cycle_count="many", max_cycles=5)
+
+    svc = AutoNudgeService(tmp_path / "store")
+    svc._load()
+    try:
+        loop = svc.get_by_id("b0d50001")
+        assert loop is not None
+        assert loop.cycle_count == 0
+        assert loop.max_cycles == 5
+        assert loop.active is False
+        assert loop.stopped_reason == INVALID_BOUNDS_REASON
+    finally:
+        svc.stop()
+
+
+def test_repaired_anchor_against_an_unlimited_cap_only_repairs(tmp_path: Path) -> None:
+    """With no finite cap to measure against, a repaired anchor changes nothing
+    about the bound: the value is normalised and persisted, the loop stays armed."""
+    _write_legacy_row(
+        tmp_path / "store",
+        created_ts=float("inf"),
+        cycle_count=-3,
+        max_cycles=0,
+        max_runtime_secs=0,
+    )
+
+    svc = AutoNudgeService(tmp_path / "store")
+    svc._load()
+    try:
+        loop = svc.get_by_id("b0d50001")
+        assert loop is not None
+        assert loop.created_ts == 0.0
+        assert loop.cycle_count == 0
+        assert loop.active is True
+        assert loop.stopped_reason == ""
+        assert svc._store_dirty is True
+    finally:
+        svc.stop()
+
+
+def test_an_inactive_row_with_an_invalid_bound_is_stamped_too(tmp_path: Path) -> None:
+    """The stamp is not gated on ``active``. A paused row whose cap was repaired
+    to zero would otherwise keep its earlier reason and, on resume, run
+    unlimited with nothing on the row saying why. The reason it gets is
+    replaceable, so a deliberate re-arm with fresh bounds still displaces it."""
+    from kiro_crew.autonudge_service.model import _stopped_row_is_replaceable
+
+    _write_legacy_row(
+        tmp_path / "store",
+        active=False,
+        stopped_reason="manual",
+        stopped_detail="paused before the trip",
+        next_due_ts=0.0,
+        max_cycles=float("nan"),
+    )
+
+    svc = AutoNudgeService(tmp_path / "store")
+    svc._load()
+    try:
+        loop = svc.get_by_id("b0d50001")
+        assert loop is not None
+        assert loop.active is False
+        assert loop.max_cycles == 0
+        assert loop.stopped_reason == INVALID_BOUNDS_REASON
+        assert loop.stopped_detail == ""  # the earlier stop's words do not describe this one
+        assert _stopped_row_is_replaceable(loop) is True
+        assert svc._store_dirty is True
+    finally:
+        svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_generic_activation_cannot_revive_an_invalid_bounds_row(tmp_path: Path) -> None:
+    """``update(active=True)`` with no caps in the patch would clear the reason
+    and run the row on its repaired zeros. The row stays inactive, keeps its
+    reason, and holds no deadline."""
+    _write_legacy_row(
+        tmp_path / "store",
+        active=True,
+        max_cycles=float("nan"),
+        max_runtime_secs=float("nan"),
+    )
+
+    svc = AutoNudgeService(tmp_path / "store")
+    svc._load()
+    try:
+        loop = svc.get_by_id("b0d50001")
+        assert loop is not None
+        assert loop.active is False and loop.stopped_reason == INVALID_BOUNDS_REASON
+
+        result = await svc.update("b0d50001", active=True)
+
+        assert result is loop
+        assert loop.active is False
+        assert loop.stopped_reason == INVALID_BOUNDS_REASON
+        assert loop.next_due_ts == 0.0
+        assert loop.max_cycles == 0 and loop.max_runtime_secs == 0
+        persisted = json.loads(svc._path.read_text(encoding="utf-8"))["loops"][0]
+        assert persisted["active"] is False
+        assert persisted["stopped_reason"] == INVALID_BOUNDS_REASON
+    finally:
+        svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_an_activation_with_one_finite_cap_still_cannot_revive_it(tmp_path: Path) -> None:
+    """The goal popover's save shape: a cap in the patch, the runtime budget
+    left to the row. The row does not say which bound was repaired, so a
+    supplied finite cap may still be measured against a repaired anchor (a
+    zero ``created_ts`` never trips the budget). The cap edit lands on the
+    paused row as any cap edit does; the revival does not."""
+    _write_legacy_row(tmp_path / "store", created_ts=float("nan"), max_runtime_secs=600)
+
+    svc = AutoNudgeService(tmp_path / "store")
+    svc._load()
+    try:
+        loop = svc.get_by_id("b0d50001")
+        assert loop is not None
+        assert loop.stopped_reason == INVALID_BOUNDS_REASON
+
+        await svc.update("b0d50001", active=True, max_cycles=10)
+
+        assert loop.active is False
+        assert loop.stopped_reason == INVALID_BOUNDS_REASON
+        assert loop.max_cycles == 10
+        assert loop.max_runtime_secs == 600
+        assert loop.next_due_ts == 0.0
+
+        await svc.update("b0d50001", active=True, max_cycles=10, max_runtime_secs=900)
+
+        assert loop.active is False
+        assert loop.stopped_reason == INVALID_BOUNDS_REASON
+    finally:
+        svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_lifting_both_caps_explicitly_revives_an_invalid_bounds_row(tmp_path: Path) -> None:
+    """The one activation that reads no stored bound: both caps set to zero in
+    the patch. This is the owner's Perpetual takeover shape, and its cycle
+    accounting and instruction survive as they do for any resumed row."""
+    _write_legacy_row(
+        tmp_path / "store",
+        max_cycles=float("nan"),
+        cycle_count=7,
+        max_runtime_secs=600,
+    )
+
+    svc = AutoNudgeService(tmp_path / "store")
+    svc._load()
+    try:
+        loop = svc.get_by_id("b0d50001")
+        assert loop is not None
+        assert loop.active is False and loop.stopped_reason == INVALID_BOUNDS_REASON
+
+        result = await svc.update("b0d50001", active=True, max_cycles=0, max_runtime_secs=0)
+
+        assert result is loop
+        assert loop.active is True
+        assert loop.stopped_reason == ""
+        assert loop.max_cycles == 0 and loop.max_runtime_secs == 0
+        assert loop.cycle_count == 7
+        assert loop.message == "go"
+    finally:
+        svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_directive_re_arm_displaces_an_invalid_bounds_row_with_fresh_bounds(
+    tmp_path: Path,
+) -> None:
+    """The bounded remedy: ``add(replace_stopped=True)`` builds a new row with
+    its own caps and anchors, and the stamped row is gone rather than revived."""
+    _write_legacy_row(tmp_path / "store", max_cycles=float("nan"), cycle_count=7)
+
+    svc = AutoNudgeService(tmp_path / "store")
+    svc._load()
+    try:
+        stamped = svc.get_by_id("b0d50001")
+        assert stamped is not None and stamped.stopped_reason == INVALID_BOUNDS_REASON
+
+        fresh = await svc.add(
+            slot_key="chat-1",
+            message="again",
+            idle_secs=60,
+            max_cycles=12,
+            max_runtime_secs=3600,
+            replace_existing=False,
+            replace_stopped=True,
+        )
+
+        assert fresh.id != stamped.id
+        assert svc.get_by_id("b0d50001") is None
+        assert [lp.id for lp in svc.list_all()] == [fresh.id]
+        assert fresh.active is True
+        assert fresh.max_cycles == 12 and fresh.max_runtime_secs == 3600
+        assert fresh.cycle_count == 0 and fresh.created_ts > 0
+    finally:
+        svc.stop()
 
 
 @pytest.mark.asyncio

@@ -39,7 +39,8 @@ before those owners moved out still resolves here as the same object its owner h
 and so does every imported name callers and tests read off it. The names moved code
 reads through this module on each call -- so a patch here reaches it -- are
 ``_OVERDUE_REARM_SECS``, ``_RECONCILE_INTERVAL_SECS``, ``replace_with_retry``,
-``fsync_dir``, ``scrubbed_judge_spec``, ``_INSTANCE``, ``_MAINTENANCE_LOCKS`` and
+``fsync_dir``, ``scrubbed_judge_spec``, ``_bounded_judge_pr_seen``, ``_INSTANCE``,
+``_MAINTENANCE_LOCKS`` and
 ``_MUTATION_LOCK_OWNERS``.
 """
 
@@ -92,6 +93,7 @@ from kiro_crew.autonudge_service.model import (  # noqa: F401 -- re-exported
     _TERMINAL_BOUND_REASONS,
     APPROVAL_STALL_REASON,
     AUTONUDGE_STOP_REASON,
+    INVALID_BOUNDS_REASON,
     MANUAL_STOP_REASON,
     MONITOR_TERMINAL_REASON,
     NUDGE_RENEW_DUE_SHARE,
@@ -774,7 +776,7 @@ class AutoNudgeService:
         # separately: self-arm trust remains on the historical deferred path,
         # while owner admission must be gone before the prior row disappears.
         self._deferred_monitor_replacements: dict[
-            str, tuple[NudgeLoop | None, NudgeLoop, bool, Any]
+            str, tuple[NudgeLoop | None, NudgeLoop, bool, Any, NudgeLoop | None]
         ] = {}
         # Runtime turn-start evidence for the narrow window between a channel
         # accepting a claimed wake and the controller persisting DISPATCHED.
@@ -1192,7 +1194,7 @@ class AutoNudgeService:
                 # store entry must be skipped, never abort start() and take the
                 # gateway offline.
                 repaired = repair_sentinel_path(loop.stop_sentinel_path)
-                # Same fail-open posture for the numeric timer fields: they
+                # Same per-entry repair posture for the numeric timer fields: they
                 # drive arithmetic at arm time (``start()`` →
                 # ``_arm_from_deadline``) and are emitted as JSON by the
                 # REST/WS surface, so both must be finite and in range. A
@@ -1219,7 +1221,9 @@ class AutoNudgeService:
                 max_cycles_num, max_cycles_repaired = _repair_number(
                     loop.max_cycles, lo=0.0, fallback=0.0
                 )
-                loop.max_cycles = int(max_cycles_num)
+                max_cycles_integral = int(max_cycles_num)
+                max_cycles_repaired = max_cycles_repaired or max_cycles_integral != max_cycles_num
+                loop.max_cycles = max_cycles_integral
                 cycle_count_num, cycle_count_repaired = _repair_number(
                     loop.cycle_count, lo=0.0, fallback=0.0
                 )
@@ -1227,7 +1231,53 @@ class AutoNudgeService:
                 runtime_num, runtime_repaired = _repair_number(
                     loop.max_runtime_secs, lo=0.0, fallback=0.0
                 )
-                loop.max_runtime_secs = int(runtime_num)
+                runtime_integral = int(runtime_num)
+                runtime_repaired = runtime_repaired or runtime_integral != runtime_num
+                loop.max_runtime_secs = runtime_integral
+                # A bound is invalid when the CAP itself was repaired, and also
+                # when the value the cap is measured AGAINST was: ``created_ts``
+                # repaired to zero makes ``runtime_budget_exceeded`` never trip
+                # (no anchor to measure from), and ``cycle_count`` repaired to
+                # zero forgets every turn already spent against ``max_cycles``.
+                # Either one leaves a cap that reads as intact while the loop
+                # runs unlimited. A repaired anchor against a cap that is
+                # already zero changes nothing about the bound, so only the
+                # finite-cap case counts.
+                bounds_invalid = (
+                    max_cycles_repaired
+                    or runtime_repaired
+                    or (created_repaired and loop.max_runtime_secs > 0)
+                    or (cycle_count_repaired and loop.max_cycles > 0)
+                )
+                if bounds_invalid:
+                    # Stamped on ACTIVE and INACTIVE rows alike, unlike the
+                    # ``sentinel_dropped`` branch below. A dropped sentinel
+                    # leaves the row's bounds intact, so a paused row keeps its
+                    # own reason and resumes bounded. A repaired bound does not:
+                    # the row now carries a zero where its cap was, and a resume
+                    # or re-arm that keeps the earlier reason would run it
+                    # unlimited with nothing on the row saying why. The reason
+                    # is what the readers show (``patrol_stopped_invalid_bounds``)
+                    # and it is in ``_REPLACEABLE_LOOP_STOP_REASONS``, so a
+                    # deliberate re-arm with fresh bounds still displaces the row.
+                    if loop.active:
+                        logger.warning(
+                            "AutoNudge: deactivating loop %s — a stored bound was invalid",
+                            loop.id,
+                        )
+                        loop.active = False
+                    else:
+                        logger.warning(
+                            "AutoNudge: loop %s is inactive with an invalid stored bound — "
+                            "recording invalid_bounds so a resume does not run it unlimited",
+                            loop.id,
+                        )
+                    loop.stopped_reason = INVALID_BOUNDS_REASON
+                    # An earlier stop's words do not describe this one.
+                    loop.stopped_detail = ""
+                    loop.next_due_ts = 0.0
+                    if loop.monitor is not None:
+                        loop.monitor.next_probe_at = 0.0
                 # ``consecutive_start_failures`` is compared with ``>=`` on every
                 # wake, and this store is agent-writable, so a persisted string or
                 # ``null`` would raise ``TypeError`` inside ``_timer`` and the

@@ -481,10 +481,11 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # host it, because that directory stays sandbox read-write for the SEL
     # appends above. Written and read only by the GATEWAY (dashboard tag CRUD
     # + the chat_tag applier); no in-sandbox code opens it.
-    "tag-grants",
-    # The auto-nudge ARM record's directory (``autonudge_selfarm.py``): which
-    # loops a crew/member session armed itself, and which the owner's Perpetual
-    # mode switch armed -- an entry here is the whole of an owner arm's fire-time
+    #
+    # This one mask ALSO holds the auto-nudge ARM record's directory,
+    # ``tag-grants/autonudge-trust`` (``autonudge_selfarm.py``): which loops a
+    # crew/member session armed itself, and which the owner's Perpetual mode
+    # switch armed -- an entry there is the whole of an owner arm's fire-time
     # admission, and the loop store it agrees with is agent-writable by design.
     # Deliberately a CHILD of ``tag-grants`` rather than a leaf of its own at the
     # data-home root: a root-level leaf is held only by its own name, so a
@@ -494,20 +495,27 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # present and future (``test_sandbox_protected_name_holds`` measures exactly
     # this split). ``tag-grants`` is the host because it already holds owner
     # authorization state of the same class, is gateway-only, pre-created 0o700
-    # before every spawn, and never swept. The entry is listed so the launcher
-    # payload names the path and the hold ratchet can pin its ancestor; the
-    # mount it would place is redundant either way round (listed after its host,
-    # the child's ``isdir`` resolves inside the empty stand-in and is skipped;
-    # bound first, it would sit under the host's mask). It needs neither a
-    # pre-create -- an absent child inside a masked host is invisible either
-    # way, and the materialiser refuses intermediate directories on purpose --
-    # nor a ``_CREW_NO_ALIAS_LEAVES`` entry: a link at the host refuses the
-    # spawn as every masked leaf does, and the alias pass walks this leaf's
-    # components too. Written and read only by the GATEWAY (the authorizer, the
-    # fire-time guard, the member route, the store's remove); no in-sandbox code
-    # opens it. Not under ``trust/``, which stays sandbox read-write for the SEL
-    # appends.
-    "tag-grants/autonudge-trust",
+    # before every spawn, and never swept. The child is NOT listed as a leaf of
+    # its own, and must not be. The mount a listing would place is redundant --
+    # a name inside the host's empty stand-in reaches nothing whether or not a
+    # second stand-in sits under it -- and a launcher that carries pre-spawn
+    # occupant identities into its mask loop REFUSES the spawn on it: the alias
+    # pass records an identity for every hidden leaf present on disk, the host's
+    # mask then makes the child's name absent inside the stand-in, and the pin
+    # reads an established object that is now absent as moved -- fail closed,
+    # every spawn, once the first arm has created the directory. The lexical
+    # nesting subtraction the launcher applies to REQUIRED targets is not
+    # applied to carried occupants, and widening that pin is not this leaf's to
+    # decide. The child needs
+    # neither a pre-create -- an absent child inside a masked host is invisible
+    # either way, and the materialiser refuses intermediate directories on
+    # purpose -- nor a ``_CREW_NO_ALIAS_LEAVES`` entry: a link at the host
+    # refuses the spawn as every masked leaf does, and the gateway opens host and
+    # child through held no-follow directory handles. Written and read only by
+    # the GATEWAY (the authorizer, the fire-time guard, the member route, the
+    # store's remove); no in-sandbox code opens it. Not under ``trust/``, which
+    # stays sandbox read-write for the SEL appends.
+    "tag-grants",
     "agentcore-inbound",
     "routing",
     "webhooks",

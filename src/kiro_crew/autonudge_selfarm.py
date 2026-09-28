@@ -17,12 +17,13 @@ the namespace lifetime, present and future. A leaf masked at the data-home root
 holds only the object present at spawn: a host-side atomic replace of that name
 puts a fresh, writable object at the protected path for the rest of a running
 namespace's life, which for an authorization record is the hole itself. Inside
-the grant store's mask the record has no such window, its name reaches the
-launcher payload as its own nested leaf (``tag-grants/autonudge-trust``, so the
-hold is measured by ``test_sandbox_protected_name_holds``), and all three ways
-of writing it are closed: the agent's file tools are fenced by
-``security._CREW_SECRET_LEAVES`` (``tag-grants`` is prefix-matched, so the whole
-subtree is fenced), a sandboxed shell -- a command that builds the path at
+the grant store's mask the record has no such window. It is held by the HOST's
+stand-in alone and is NOT a hidden leaf of its own (no hidden leaf may nest
+under another; ``test_sandbox_protected_name_holds`` pins both the enclosing
+hold and the no-nesting rule), and all three ways of writing it are closed: the
+agent's file tools are fenced by ``security._CREW_SECRET_LEAVES``
+(``tag-grants`` is prefix-matched, so the whole subtree is fenced), a sandboxed
+shell -- a command that builds the path at
 runtime, which no text matcher sees -- resolves inside the empty stand-in, and
 no in-sandbox code opens it: only gateway code opening the path directly -- the
 authorizer at the moment it admits an arm, the owner's switch, the store's
@@ -82,6 +83,7 @@ import json
 import logging
 import os
 import secrets
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -116,12 +118,15 @@ ARM_RECORD_HOST_DIRNAME = "tag-grants"
 #: host's empty stand-in and never this name, whether or not it exists yet.
 ARM_RECORD_DIRNAME = "autonudge-trust"
 
-#: The data-home-relative leaf the sandbox names for the record's directory.
-#: Listed in ``sandbox._CREW_HIDDEN_LEAVES`` beneath its host so the launcher
-#: payload carries the path and ``test_sandbox_protected_name_holds`` can prove
-#: the hold is the HOST's stand-in (``HELD_BY_ENCLOSING_MASK``), not a leaf-only
-#: mask at the data-home root. Never pre-created and never in
-#: ``_CREW_NO_ALIAS_LEAVES``: both jobs are the host's.
+#: The data-home-relative path of the record's directory, spelled once so the
+#: sandbox tests can name it. NOT listed in ``sandbox._CREW_HIDDEN_LEAVES``: the
+#: hold is the HOST's stand-in, which already makes every name inside it
+#: unreachable, and a hidden leaf nested under another hidden leaf is refused
+#: at spawn by a launcher that pins carried occupant identities (the host's
+#: mask leaves the child's name absent at pin time);
+#: ``TestNoHiddenLeafNestsUnderAnother`` in ``test_sandbox_protected_name_holds``
+#: pins the rule. Never pre-created and never in ``_CREW_NO_ALIAS_LEAVES``: both
+#: jobs are the host's.
 ARM_RECORD_LEAF = f"{ARM_RECORD_HOST_DIRNAME}/{ARM_RECORD_DIRNAME}"
 
 #: The directory an older layout kept the record in. Read only by
@@ -159,6 +164,10 @@ class OwnerArmRevocation:
     loop_id: str
     slot_key: str
     token: str
+
+
+class OwnerArmGrantInProgress(OSError):
+    """A non-authorizing owner takeover still holds this loop's entry."""
 
 
 #: Domain separator for the record's seal, so a value minted here can never
@@ -471,20 +480,53 @@ def _retire_legacy_record() -> None:
     ``OSError`` is logged and the caller proceeds on the new path.
     """
     legacy = _legacy_record_path()
+    held: list[int] = []
     try:
-        if not legacy.is_file():
-            return
-        legacy.unlink()
+        if _descriptor_relative():
+            home_fd = _pin_held(data_home())
+            held.append(home_fd)
+            try:
+                legacy_dir_fd = os.open(
+                    _LEGACY_DIRNAME,
+                    _dir_open_flags(),
+                    dir_fd=home_fd,
+                )
+            except FileNotFoundError:
+                return
+            held.append(legacy_dir_fd)
+            try:
+                record_stat = os.stat(
+                    SELF_ARM_RECORD_NAME,
+                    dir_fd=legacy_dir_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return
+            if not stat.S_ISREG(record_stat.st_mode):
+                return
+            os.unlink(SELF_ARM_RECORD_NAME, dir_fd=legacy_dir_fd)
+            with contextlib.suppress(OSError):
+                os.unlink(_LOCK_NAME, dir_fd=legacy_dir_fd)
+        else:
+            try:
+                held.append(_pin_held(legacy.parent))
+            except FileNotFoundError:
+                return
+            if not legacy.is_file():
+                return
+            legacy.unlink()
+            with contextlib.suppress(OSError):
+                (legacy.parent / _LOCK_NAME).unlink()
         logger.warning(
             "legacy autonudge trust record at %s discarded (that directory is writable "
             "from the agent sandbox, so its entries cannot be trusted); loops armed before "
             "this upgrade must be armed again",
             legacy,
         )
-        with contextlib.suppress(OSError):
-            (legacy.parent / _LOCK_NAME).unlink()
     except OSError:
         logger.warning("could not discard the legacy autonudge trust record", exc_info=True)
+    finally:
+        _release_held(held)
 
 
 def _load_record_file(
@@ -956,6 +998,70 @@ def rollback_owner_arm_revocation(revocation: OwnerArmRevocation) -> bool:
         return True
 
 
+def _resolved_owner_arm_fence(
+    loop_id: str,
+    entry: Any,
+    accepted: tuple[Any, ...] | None,
+) -> dict[str, Any] | None:
+    """Resolve one fenced entry from the loader's accepted durable row shape."""
+    marker = entry.get(_OWNER_REVOCATION_KEY) if isinstance(entry, dict) else None
+    if isinstance(marker, dict) and marker.get("action") == "grant":
+        token = marker.get("token")
+        if not isinstance(token, str):
+            raise OSError(f"pending owner admission for {loop_id} is malformed")
+        takeover = OwnerArmRevocation(str(loop_id), str(entry.get("slot_key", "")), token)
+        matched = _matching_owner_takeover(entry, takeover)
+        if matched is None:
+            raise OSError(f"pending owner admission for {loop_id} is malformed")
+        prior, owner = matched
+        if accepted is None or accepted[0] != takeover.slot_key:
+            return None
+        if len(accepted) >= 5 and accepted[2:] == (True, 0, 0):
+            return owner
+        return prior
+    if not isinstance(marker, dict) or not isinstance(marker.get("token"), str):
+        raise OSError(f"owner admission revocation for {loop_id} is malformed")
+    revocation = OwnerArmRevocation(str(loop_id), str(entry.get("slot_key", "")), marker["token"])
+    prior = _matching_owner_revocation(entry, revocation)
+    if prior is None:
+        raise OSError(f"owner admission revocation for {loop_id} is malformed")
+    expected_fingerprint = marker["loop_fingerprint"]
+    if (
+        accepted is not None
+        and len(accepted) >= 2
+        and accepted[:2] == (revocation.slot_key, expected_fingerprint)
+    ):
+        return prior
+    return None
+
+
+def recover_owner_arm_takeover(
+    takeover: OwnerArmRevocation,
+    accepted_loop_row: tuple[Any, ...] | None,
+) -> bool:
+    """Resolve this transaction's pending grant without touching sibling fences.
+
+    The accepted row uses the same slot/active/cap verdict as startup recovery.
+    The takeover token keeps a later transaction safe from this recovery pass.
+    """
+    with _record_lock() as dir_fd:
+        entries = _read_record_strict_raw(dir_fd)
+        entry = entries.get(takeover.loop_id)
+        if _matching_owner_takeover(entry, takeover) is None:
+            return False
+        resolved = _resolved_owner_arm_fence(
+            takeover.loop_id,
+            entry,
+            accepted_loop_row,
+        )
+        if resolved is None:
+            del entries[takeover.loop_id]
+        else:
+            entries[takeover.loop_id] = resolved
+        _write_record(entries, dir_fd)
+        return True
+
+
 def recover_owner_arm_revocation(
     accepted_loop_rows: Mapping[str, tuple[Any, ...]],
 ) -> None:
@@ -998,42 +1104,9 @@ def recover_owner_arm_revocation(
         # with the record untouched, so no sibling's verdict lands without it.
         resolved: dict[str, dict[str, Any] | None] = {}
         for loop_id, entry in fenced:
-            marker = entry.get(_OWNER_REVOCATION_KEY)
-            if isinstance(marker, dict) and marker.get("action") == "grant":
-                token = marker.get("token")
-                if not isinstance(token, str):
-                    raise OSError(f"pending owner admission for {loop_id} is malformed")
-                takeover = OwnerArmRevocation(str(loop_id), str(entry.get("slot_key", "")), token)
-                matched = _matching_owner_takeover(entry, takeover)
-                if matched is None:
-                    raise OSError(f"pending owner admission for {loop_id} is malformed")
-                prior, owner = matched
-                accepted = accepted_loop_rows.get(str(loop_id))
-                if accepted is None or accepted[0] != takeover.slot_key:
-                    resolved[str(loop_id)] = None
-                elif len(accepted) >= 5 and accepted[2:] == (True, 0, 0):
-                    resolved[str(loop_id)] = owner
-                else:
-                    resolved[str(loop_id)] = prior
-                continue
-            if not isinstance(marker, dict) or not isinstance(marker.get("token"), str):
-                raise OSError(f"owner admission revocation for {loop_id} is malformed")
-            revocation = OwnerArmRevocation(
-                str(loop_id), str(entry.get("slot_key", "")), marker["token"]
+            resolved[str(loop_id)] = _resolved_owner_arm_fence(
+                str(loop_id), entry, accepted_loop_rows.get(str(loop_id))
             )
-            prior = _matching_owner_revocation(entry, revocation)
-            if prior is None:
-                raise OSError(f"owner admission revocation for {loop_id} is malformed")
-            accepted = accepted_loop_rows.get(str(loop_id))
-            expected_fingerprint = marker["loop_fingerprint"]
-            if (
-                accepted is not None
-                and len(accepted) >= 2
-                and accepted[:2] == (revocation.slot_key, expected_fingerprint)
-            ):
-                resolved[str(loop_id)] = prior
-            else:
-                resolved[str(loop_id)] = None
         for loop_id, prior in resolved.items():
             if prior is None:
                 del entries[loop_id]
@@ -1179,6 +1252,9 @@ def revoke_arm_if_slot(loop_id: str, slot_key: str) -> bool:
         if not isinstance(entry, dict) or entry.get("slot_key") != str(slot_key):
             return False
         if _OWNER_REVOCATION_KEY in entry:
+            marker = entry[_OWNER_REVOCATION_KEY]
+            if isinstance(marker, dict) and marker.get("action") == "grant":
+                raise OwnerArmGrantInProgress(f"owner admission grant is in progress for {loop_id}")
             raise OSError(f"owner admission revocation is in progress for {loop_id}")
         del entries[str(loop_id)]
         _write_record(entries, dir_fd)
@@ -1310,13 +1386,12 @@ def recorded_arm_ids_for_slot_strict(slot_key: str) -> list[str]:
     has no string ``slot_key`` cannot be attributed to any slot and cannot admit
     a wake (every reader refuses it), so it is skipped rather than raised on --
     one malformed sibling must not refuse every member's OFF. An entry for THIS
-    slot fenced by an owner-revocation envelope is CONTENTION, and raises like
-    an unreadable record: the fence is a transaction in flight whose rollback
-    puts the prior party back, so an OFF that skipped it could report success
-    and then see the authorization restored under it. The caller refuses
-    (nothing mutated) and the owner presses OFF again once the transaction has
-    settled. Another slot's fence is that slot's business and is simply not
-    this slot's entry. Blocking file IO: callers offload.
+    slot fenced by an owner-revocation envelope is CONTENTION. A pending grant
+    is returned as an id so OFF can pause its active row and let the typed
+    revoke refusal keep it paused; startup then restores the prior party. A
+    pending revocation still raises because its rollback can restore admission
+    under an OFF that skipped it. Another slot's fence is that slot's business
+    and is simply not this slot's entry. Blocking file IO: callers offload.
     """
     entries = _read_record_strict_raw()
     out: list[str] = []
@@ -1324,9 +1399,124 @@ def recorded_arm_ids_for_slot_strict(slot_key: str) -> list[str]:
         if not isinstance(entry, dict) or entry.get("slot_key") != str(slot_key):
             continue
         if _OWNER_REVOCATION_KEY in entry:
+            marker = entry[_OWNER_REVOCATION_KEY]
+            if isinstance(marker, dict) and marker.get("action") == "grant":
+                out.append(str(loop_id))
+                continue
             raise OSError(f"owner admission revocation is in progress for {loop_id}")
         out.append(str(loop_id))
     return sorted(out)
+
+
+async def drain_future_deferring_cancellation(fut: "asyncio.Future[Any]") -> bool:
+    """Wait until *fut* has settled, absorbing every cancellation meanwhile.
+
+    The ONE join loop behind every "finish the step, then honour the cancel"
+    wait in the nudge stack: the trust writers below, the service's shielded
+    persists (``autonudge_service.maintenance``) and the authorizer's
+    transaction steps and settle-after-cancel (``autonudge_authz``). Awaited
+    through a shield in a loop, so a second or third cancellation during the
+    wait does not abandon the future either. Returns whether the CALLER was
+    cancelled; the future's own outcome -- value, error, or its own
+    cancellation -- is left in it for the caller to read with whatever
+    precedence that caller owes its transaction. The shield raises
+    ``CancelledError`` for both the caller's cancellation and the inner
+    future's, so the two are told apart by what the future holds and by what
+    landed on the current task: a future that was cancelled from outside
+    settled on its own and is not a cancel of the caller; a caller cancel that
+    lands as an uncancelled future completes (the shield drops the value it
+    was about to deliver) still counts; and when the two land in the SAME tick
+    -- the future cancelled and the task cancelled before this loop resumes --
+    the shield raises one ``CancelledError`` for both and ``fut.cancelled()``
+    alone would hide the caller's, so a rise in ``Task.cancelling()`` across
+    the wait is the caller's cancel too, whatever object the shield raised
+    (the task runtime folds a cancel requested after the future settled into
+    the error it was about to deliver). A ``CancelledError`` the future STORES
+    (``set_exception``) is its own error, not a cancel of anyone, and -- absent
+    a cancel of the caller in the same wait -- is told by identity: the shield
+    delivers a settled future's error as the very object the future holds
+    (:func:`_is_stored_outcome`). Nothing the
+    future itself raises leaves this loop, but a ``BaseException`` that is not
+    the future's stored outcome -- ``GeneratorExit`` on teardown,
+    ``KeyboardInterrupt``, ``SystemExit``, a runtime error inside the shield
+    -- propagates whether the future is still pending or settled in the same
+    tick it arrived: it was never the future's outcome, and absorbing it would
+    tell the caller a still-pending future has settled or lose an interrupt
+    behind a value. This module is the leaf all of those callers already
+    import, which is why the loop lives here.
+    """
+    task = asyncio.current_task()
+    cancelled = False
+    while not fut.done():
+        cancels_before = task.cancelling() if task is not None else 0
+        try:
+            await asyncio.shield(fut)
+        except asyncio.CancelledError as exc:
+            if task is not None and task.cancelling() > cancels_before:
+                # A cancel was requested of the caller during this wait.
+                # Whatever the shield raised -- the caller's own cancel, the
+                # future's cancellation landing in the same tick, or a stored
+                # CancelledError the task runtime folded the caller's pending
+                # cancel into -- the caller must unwind.
+                cancelled = True
+            elif not fut.cancelled() and not _is_stored_outcome(fut, exc):
+                # No new cancel on the task, and the future neither cancelled
+                # itself nor settled with this very error: a cancel requested
+                # of the caller before this wait began, delivered as the
+                # shield yielded (over a pending future, or over a completed
+                # one whose value it dropped).
+                cancelled = True
+            # Otherwise the future's own cancellation, or the CancelledError
+            # it STORES: its outcome, left in it for the caller to read.
+        except BaseException as exc:
+            if _is_stored_outcome(fut, exc):
+                # A settled future raises its own error through the shield;
+                # the caller reads that outcome once cancellation precedence
+                # is known.
+                break
+            # Not the future's outcome, whether or not the future has settled
+            # meanwhile: this came from the runtime and is not this loop's to
+            # absorb.
+            raise
+    return cancelled
+
+
+def _is_stored_outcome(fut: "asyncio.Future[Any]", exc: BaseException) -> bool:
+    """Whether *exc* is the exception *fut* itself settled with.
+
+    ``Future.set_exception`` keeps the object it is given and ``result()``
+    re-raises that same object, so the error the shield delivers for a settled
+    future IS the one the future stores. Identity therefore tells the future's
+    own outcome -- an error, a ``CancelledError`` stored rather than raised by
+    ``cancel()``, a ``BaseException`` a worker raised -- apart from anything
+    the runtime threw at the waiting task, even when both arrive in the same
+    tick. A pending or cancelled future stores no exception, so neither can
+    match.
+    """
+    return fut.done() and not fut.cancelled() and fut.exception() is exc
+
+
+async def await_future_deferring_cancellation(
+    future: "asyncio.Future[Any]",
+) -> tuple[Any, bool]:
+    """Join *future* and report cancellation only after its result is known.
+
+    A cancellation requested of the current task before the join began counts
+    too (``Task.cancelling()``), so a caller that cancels itself and then joins
+    an already-settled future still learns it must unwind. The future's error
+    is raised as the caller's -- unless cancellation wins, in which case it is
+    chained as the cause of the ``CancelledError`` raised instead.
+    """
+    cancelled = await drain_future_deferring_cancellation(future)
+    task = asyncio.current_task()
+    cancelled = cancelled or bool(task is not None and task.cancelling())
+    try:
+        result = future.result()
+    except BaseException as error:
+        if cancelled:
+            raise asyncio.CancelledError from error
+        raise
+    return result, cancelled
 
 
 async def await_thread_deferring_cancellation(
@@ -1338,25 +1528,9 @@ async def await_thread_deferring_cancellation(
     step before re-raising. Repeated cancellation is absorbed until the worker
     has ended, so no trust writer outlives the transaction that started it.
     """
-    fut = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
-    cancelled = False
-    while not fut.done():
-        try:
-            await asyncio.shield(fut)
-        except asyncio.CancelledError:
-            cancelled = True
-        except Exception:
-            # Retain the worker error until cancellation precedence is known.
-            break
-    task = asyncio.current_task()
-    cancelled = cancelled or bool(task is not None and task.cancelling())
-    try:
-        result = fut.result()
-    except Exception:
-        if cancelled:
-            raise asyncio.CancelledError
-        raise
-    return result, cancelled
+    return await await_future_deferring_cancellation(
+        asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+    )
 
 
 async def await_thread_to_completion(fn: Any, *args: Any, **kwargs: Any) -> Any:
