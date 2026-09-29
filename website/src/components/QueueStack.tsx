@@ -9,6 +9,7 @@ import { i18nT } from '../i18n/t'
 import { parseRecoveryMessage } from '../pages/chat/RecoveryCard'
 import { stripAppEnvelope } from '../pages/chat/groupDisplayItems'
 import { hasSubagentCompletionPrefix } from '../pages/chat/subagentCompletion'
+import { readMessageQuote, stripQuoteBlock } from '../chat-core/composer/messageQuote'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 /** System-injected sub-agent completion deliveries waiting for the busy slot.
  *  These are NOT user messages: they must not be editable/cancellable (either
@@ -48,8 +49,12 @@ export function isAppMessageQueued(m: ChatMessage): boolean {
  *  envelope so the queue card wears the same skin the transcript row will —
  *  two skins for one message read as two different messages. */
 export function queuedDisplayText(m: ChatMessage): string {
-  if (!isAppMessageQueued(m)) return m.content
-  return stripAppEnvelope(m.content)
+  if (isAppMessageQueued(m)) return stripAppEnvelope(m.content)
+  // A quoting entry's one visible line is what the user typed, not the
+  // quoted message: the block comes off the head exactly as the sent bubble
+  // strips it (`UserMessage`), so two entries quoting the same reply differ.
+  const quote = readMessageQuote(m.meta as Record<string, unknown> | undefined)
+  return quote ? stripQuoteBlock(m.content, quote) : m.content
 }
 
 /** Split a slot's message list into the three things a pane surface needs:
