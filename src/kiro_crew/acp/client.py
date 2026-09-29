@@ -77,6 +77,7 @@ from kiro_crew.acp._dispatch import (
     error_is_refusal_terminal,
     extract_tool_purpose,
     gate_envelope,
+    harness_tool_name,
 )
 from kiro_crew.acp._dispatch import identified_mcp_call as _identified_mcp_call
 from kiro_crew.acp._dispatch import is_mcp_tool_approval as _is_mcp_tool_approval
@@ -3663,6 +3664,9 @@ class AcpClient:
         # canonical mcp__<server>__<tool> for per-tool governance in the
         # app-own-server auto-approve.
         self._tool_call_tool_name: dict[str, str] = {}
+        # toolCallId -> the tool's own name its tool_call frame stated, for the
+        # permission event's harness_tool_id (see _dispatch.harness_tool_name).
+        self._tool_call_harness_tool_name: dict[str, str] = {}
         # Structured raw tool params (rawInput dict) keyed by toolCallId, cached
         # from the ToolCall notification so the later request_permission event —
         # which carries only a truncated title — can recover the real path/url
@@ -10835,6 +10839,7 @@ class AcpClient:
         self._pending_skill_reads.clear()
         self._tool_call_mcp_server.clear()
         self._tool_call_tool_name.clear()
+        self._tool_call_harness_tool_name.clear()
         self._tool_call_params.clear()
         self._tool_call_diff_path.clear()
         # Reset the per-turn observed-tool-call bookkeeping (see __init__).
@@ -12835,6 +12840,12 @@ class AcpClient:
                 # Cache the trusted tool name too, so the permission event can
                 # rebuild mcp__<server>__<tool> for per-tool governance.
                 self._tool_call_tool_name[tool_call_id] = identity.tool_name
+                # The tool's own name, for the permission event's
+                # harness_tool_id on a backend with no _meta.kiro.toolId.
+                # getattr for the same reason as _tool_call_unclassified.
+                _harness_names = getattr(self, "_tool_call_harness_tool_name", None)
+                if _harness_names is not None:
+                    _harness_names[tool_call_id] = harness_tool_name(update)
             title = _select_tool_title(title, raw_input, kind, is_shell=is_shell) or ""
             if title:
                 title, _ = redact_exfiltration_urls(title)
@@ -13249,6 +13260,20 @@ class AcpClient:
         if msg.id is not None:
             self._pi_gate_request_tool[str(msg.id)] = tool_call_id
 
+    def _placed_mcp_server_names(self) -> tuple[str, ...]:
+        """The server names Crew placed on this session's ``mcpServers`` array.
+
+        Empty when the session has none, including a client built without
+        ``__init__``, which has no array cache to read.
+        """
+        if getattr(self, "_session_mcp_cache", None) is None:
+            return ()
+        return tuple(
+            element["name"]
+            for element in self._session_mcp_servers()
+            if isinstance(element, dict) and isinstance(element.get("name"), str)
+        )
+
     def _build_permission_event(self, msg: JsonRpcMessage) -> AcpEvent | None:
         """Build one permission event through the transport-shared parser.
 
@@ -13276,6 +13301,7 @@ class AcpClient:
             diff_path_cache=getattr(self, "_tool_call_diff_path", None),
             mcp_server_name_cache=self._tool_call_mcp_server,
             tool_name_cache=self._tool_call_tool_name,
+            harness_tool_name_cache=getattr(self, "_tool_call_harness_tool_name", None),
             # Set only for a session running Kiro Crew's gate extension, whose
             # dialogs carry the nonce this spawn issued; ``None`` everywhere else,
             # so no other harness's permission frame is ever read as an envelope.
@@ -13283,6 +13309,8 @@ class AcpClient:
             # ``__init__`` has no nonce, and no nonce means no envelope is trusted.
             gate_envelope_nonce=_gate_nonce or None,
             kas_consent_meta=self.backend == ACP_BACKEND_KAS,
+            harness_backend=self.backend,
+            harness_mcp_servers=self._placed_mcp_server_names(),
         )
         if event is None:
             return None
