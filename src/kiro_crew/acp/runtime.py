@@ -45,7 +45,7 @@ from kiro_crew.acp._dispatch import reject_option_id as _reject_option_id
 from kiro_crew.acp._dispatch import (
     set_mode_params,
 )
-from kiro_crew.acp._frame_record import record_frame
+from kiro_crew.acp._frame_record import DIRECTION_OUT, record_frame
 from kiro_crew.acp.client import (
     _apply_pod_home_remap,
     _is_safe_oauth_url,
@@ -4825,7 +4825,8 @@ class AcpRuntime:
             self._routed_requests[req_id] = session_id
 
         req = JsonRpcRequest(method=method, params=params, id=req_id)
-        data = json.dumps(req.to_dict()) + "\n"
+        frame = req.to_dict()
+        data = json.dumps(frame) + "\n"
 
         try:
             # Under the write lock so a response frame waiting behind this
@@ -4843,6 +4844,10 @@ class AcpRuntime:
             self._mark_dead(f"pipe broken: {exc}")
             raise AcpRuntimeDead(f"pipe broken: {exc}") from exc
 
+        # Recorded only now, after the write call returned: a frame the pipe
+        # refused must not appear in the capture as sent.
+        if self.recording_allowed:
+            await record_frame(self._acp_backend, frame, len(data), DIRECTION_OUT)
         self._last_activity = time.monotonic()
         return req_id
 
@@ -4876,6 +4881,11 @@ class AcpRuntime:
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._mark_dead(f"pipe broken: {exc}")
             raise AcpRuntimeDead(f"pipe broken: {exc}") from exc
+
+        # Recorded only now: every outcome above put the bytes in the transport
+        # (they differ in drain evidence), while a raise did not.
+        if self.recording_allowed:
+            await record_frame(self._acp_backend, msg, len(data), DIRECTION_OUT)
 
         # Only a drained frame is evidence the backend moved: an unlocked append
         # or a stall must not refresh the activity clock the idle/wedged-turn
@@ -5077,7 +5087,8 @@ class AcpRuntime:
         if projection is not None:
             params = projection.request(method, params)
         req = JsonRpcRequest(method=method, params=params, id=req_id)
-        data = json.dumps(req.to_dict()) + "\n"
+        frame = req.to_dict()
+        data = json.dumps(frame) + "\n"
 
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending_requests[req_id] = future
@@ -5106,6 +5117,10 @@ class AcpRuntime:
             self._mark_dead(f"pipe broken: {exc}")
             raise AcpRuntimeDead(f"pipe broken: {exc}") from exc
 
+        # Recorded only now, after the write call returned: a frame the pipe
+        # refused must not appear in the capture as sent.
+        if self.recording_allowed:
+            await record_frame(self._acp_backend, frame, len(data), DIRECTION_OUT)
         self._last_activity = time.monotonic()
         return future
 
@@ -5138,6 +5153,10 @@ class AcpRuntime:
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._mark_dead(f"pipe broken: {exc}")
             raise AcpRuntimeDead(f"pipe broken: {exc}") from exc
+        # Recorded only now, after the write call returned: a frame the pipe
+        # refused must not appear in the capture as sent.
+        if self.recording_allowed:
+            await record_frame(self._acp_backend, msg, len(data), DIRECTION_OUT)
 
     async def send_error(self, request_id: str | int, code: int, message: str) -> None:
         """Send a JSON-RPC error response."""
@@ -5154,6 +5173,10 @@ class AcpRuntime:
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._mark_dead(f"pipe broken: {exc}")
             raise AcpRuntimeDead(f"pipe broken: {exc}") from exc
+        # Recorded only now, after the write call returned: a frame the pipe
+        # refused must not appear in the capture as sent.
+        if self.recording_allowed:
+            await record_frame(self._acp_backend, msg, len(data), DIRECTION_OUT)
 
     def unregister_session(self, session_id: str) -> None:
         """Unregister a session queue (called by AcpSessionHandle.destroy)."""
@@ -7881,7 +7904,8 @@ class AcpRuntime:
         if projection is not None and translate:
             params = projection.request(method, params)
         req = JsonRpcRequest(method=method, params=params, id=req_id)
-        data = json.dumps(req.to_dict()) + "\n"
+        frame = req.to_dict()
+        data = json.dumps(frame) + "\n"
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
@@ -7909,6 +7933,10 @@ class AcpRuntime:
             self._mark_dead(f"pipe broken: {exc}")
             raise AcpRuntimeDead(f"pipe broken: {exc}") from exc
 
+        # Recorded only now, after the write call returned: a frame the pipe
+        # refused must not appear in the capture as sent.
+        if self.recording_allowed:
+            await record_frame(self._acp_backend, frame, len(data), DIRECTION_OUT)
         self._last_activity = time.monotonic()
 
         stage = {
