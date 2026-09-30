@@ -1675,11 +1675,15 @@ registration. Both server entrypoints defer initial activation until after liste
 default-off startup leaves it absent until the first live enable. Later toggles
 retain the same instance and budgets. Cleanup disables and awaits its worker.
 Enabling queues eligible open sessions, and post-restore startup does the same
-when enabled. A session another session created (a team worker, `created_by`
-set) is not eligible: every attempt comes from the one shared hourly budget, so a
-fan-out would otherwise spend it on workers and starve the session a person
-follows. A worker's card read answers `unavailable` without queuing work, and its
-team-panel tile shows host state only. Live user/assistant messages, errors, turn completion and pending
+when enabled. Only a ROOT session is eligible (`is_root_session`: no `created_by`
+and no session-tree parent, so an adopted worker is excluded too): every attempt
+comes from the one shared hourly budget, so a fan-out would otherwise spend it on
+workers and starve the session a person follows. A worker's card read answers
+`unavailable` without queuing work, and its team-panel tile shows host state only.
+The card's numbers are folded from the session's crew log and re-bound on each later
+crew-log event without a model call; the model writes only the layout and three
+sentences, and a card whose model part carries a digit is refused (see
+[artifacts](artifacts.md)). Live user/assistant messages, errors, turn completion and pending
 questions enqueue subsequent updates, independently of an attached stream
 reader. Replay, token chunks, GET and polling do not enqueue model work; that
 includes a History resume, whose rebuild replays the window while the slot is

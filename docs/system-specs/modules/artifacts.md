@@ -52,6 +52,43 @@ The event, privacy and resource contract is in
 The Needs you inbox precedes cards, and all answer/approval authority stays in
 native controls. Disabling automatic content does not disable those controls.
 
+### The root session's automatic card: numbers from folds, sentences from the model
+
+Only a ROOT session gets an automatic card. Root is
+`card_lifecycle.is_root_session`: an empty `_created_by` (the birth-time edge) AND no
+parent in the crew log's session tree (the edge an adopt or release moves later, the
+same `parent_slot is None` the sidebar reads through `parent_payload`). A worker gets no
+card; the browser's `SessionStatusFrame` mirrors both edges (`created_by` and `parent`)
+and never fetches one for it.
+
+Every number on that card comes from the session's own crew log. `build_crew_main` in
+`kiro_crew.crew_main_contract` folds four renders -- `status`, `work`, `usage`,
+`approvals` -- into `CrewMainDerived`, every value a finished string. Absence is
+three-state in words: a missing key reads `not recorded`, a fold that could not be read
+reads `could not be read`. No value is a percentage, and every count states its
+denominator.
+
+The model still designs the card's layout, as before, but writes no number. It receives
+the folded values under `facts` as read-only text and binds each one by field name with
+`data-dashboard-field`; its own data is exactly `lede`, `you` and `notes`. The publish
+seam (`_root_card_output`) refuses the whole card when the model's part carries a digit
+-- in a sentence, in any text the layout shows, or as a JSON number -- when it writes a
+field it does not own, when its layout binds a name outside the contract, or when its
+layout leaves any fact unbound (`_layout_hides_a_fact`), since a layout of three
+sentences would publish a card with no numbers. Digits in CSS are layout and pass. Only then does `merge_crew_main`, which names every field, put
+the folded values beside the three sentences.
+
+The session folds are read from the crew log UNIT the slot writes now
+(`crew_log.emit.slot_previous_store`), never from the slot's session key: a fold of a
+name no unit carries is an empty record whose counts read as zero. No unit of the slot
+at all reads `not recorded`; units the store cannot rank read `could not be read`.
+
+Numbers follow the log between generations. Each batch the crew-log writer commits
+(`emit.add_growth_listener`) for a slot whose card is already published re-folds and
+re-binds the numbers on a task of its own, with no model
+call, no permit and none of the hourly budget; the layout and the sentences stay as the
+model last returned them. The opt-in and the budget therefore pace the sentences only.
+
 An HTML/widget artifact tagged `task-dashboard` is a model-authored task view,
 not a fixed dashboard schema. The chat's **Dynamic Dashboard** side-panel tab
 (labelled **Dashboard**; the three-tile dock above the composer opens it) and Crew's
