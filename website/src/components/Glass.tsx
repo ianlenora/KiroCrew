@@ -22,12 +22,17 @@
  * they are (`variant`), how round they are (`radius`) and which element they
  * ARE (`as`); they never restate the optics.
  *
- * Two variants, one recipe: `panel` and `chip` now share the same optics
- * (frost 4, light 25) -- the maintainer wants one blur across every pane and the
- * light band reaching full white on every edge, chips included -- and differ
- * only in name, kept so a call site still says which kind of box it is; the
- * chip used to run lighter (frost 4, light 18) for the small pills and cards, where
- * the panel numbers read heavy at 30px tall.
+ * Two variants: `panel` and `chip` share the light band (25, full white on
+ * every edge, chips included) but NOT the blur. The panel is the material the
+ * composer dock is built from, and it floats over the transcript scroller with
+ * the conversation scrolling UNDER it -- the tint (~40-45% opaque) and this
+ * blur are the ONLY thing hiding that content, there is no opaque fade band.
+ * At frost 4 a tall message mid-scroll read straight THROUGH the pane (#15225):
+ * a 4px blur leaves ~13px body glyphs legible and 55-60% of the backdrop shows
+ * past the tint. The panel runs a heavier blur (12) so the strip it covers is
+ * smeared past reading; the chip stays light (4) -- a small pill does not cover
+ * a scrolling message, and the heavier blur read foggy at 30px tall.
+ * (The chip used to run lighter still, light 18, before the bands were unified.)
  *
  * The pane IS the host element — there is no wrapper box. A follow-up chip is
  * `<Glass as="button" …>`: the button is the flex item, carries the width cap,
@@ -54,7 +59,7 @@ import { LiquidGlass, type GlassHostTag, type LiquidGlassOwnProps, type LiquidGl
 export type GlassVariant = 'panel' | 'chip'
 
 const RECIPE: Record<GlassVariant, Pick<LiquidGlassOwnProps, 'frost' | 'lightIntensity'>> = {
-  panel: { frost: 4, lightIntensity: 25 },
+  panel: { frost: 12, lightIntensity: 25 },
   chip: { frost: 4, lightIntensity: 25 },
 }
 
