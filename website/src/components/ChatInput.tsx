@@ -581,6 +581,7 @@ function ChatInput({
           color, no step; the caret is the indicator), and adds the approval glow
           while a decision is pending: the glow takes the shadow slot. */}
       <Glass
+        variant="composer"
         radius={16}
         data-testid="composer-dock"
         className={hasApproval ? 'glass-shadow approval-glow' : 'glass-shadow'}
