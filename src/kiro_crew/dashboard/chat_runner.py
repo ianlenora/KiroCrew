@@ -6608,6 +6608,93 @@ def _note_cycle_start_failure(slot_key: str, exc: BaseException, *, self_wake: b
         logger.debug("autonudge.notify_cycle_start_failed failed", exc_info=True)
 
 
+async def _note_cycle_failure(
+    slot_key: str,
+    exc: BaseException,
+    *,
+    self_wake: bool,
+    loop_id: str,
+    expected_generation: int,
+    err_meta: object = None,
+) -> None:
+    """Report a cycle that reached a model session and then DIED to its loop.
+
+    The generic superset the three narrow bounds miss: a self-wake cycle that
+    dispatched and then died terminally -- a backend error after retries were
+    spent, a persistent tool error, a prompt timeout -- rather than one of the
+    specific deterministic rejections, approval stalls or never-got-a-session
+    streaks that already have their own stand-down. Called from BOTH terminal
+    arms (an ``AcpError`` and the generic ``except Exception`` that catches the
+    ``AcpRuntimeError`` timeout family and plain errors), which is why this is a
+    helper and not an inline block: a report in only one arm would miss whichever
+    death the other serves, and the gate below -- the part with the regression
+    risk -- is then tested once instead of twice.
+
+    The gate, in the one place it is defined:
+
+    * ``self_wake`` -- only the loop's OWN delivered cycle counts; a human turn
+      that happened to error on a slot that also carries a loop must not spend
+      the loop's stand-down budget. Same marker ``_note_cycle_start_failure``
+      relies on.
+    * NOT a session-start failure -- that has its own streak
+      (``notify_cycle_start_failed``); the ``session_start_failed`` tag is read
+      with ``getattr`` because the two ACP families carry it independently.
+    * NOT a structural rejection -- that is one deterministic turn with its own
+      terminal stop (``structural_terminal`` tag); counting it here would
+      double-charge the same fault.
+    * NOT a pre-dispatch fault -- a memory store that would not open
+      (``memory_unavailable``) or a member agent file changed out of band
+      (``materialization_changed``) never reached a session at all, so the
+      "reached a session and then died" stand-down (and the operator notice that
+      names a backend/tool/timeout cause) must not fire for them. Identified by
+      the already-resolved row meta, so no new classification is needed. A plain
+      internal bug is NOT excluded: a self-wake cycle that dispatches and raises
+      the same bug every interval is exactly the no-progress waste this bound
+      ends.
+
+    Scoped to the fired loop by BOTH its id (``loop_id``) AND its config
+    generation (``expected_generation``), captured at fire time, so neither a
+    stale completion of a since-revised loop (A->B->A) nor a stale completion of
+    a loop since REPLACED by a fresh one on the same slot and generation can
+    charge the loop live on the slot now -- the same ``(id, generation)`` fence
+    the structural verdict uses. The service matches both under its lock.
+
+    Awaited, not fire-and-forget: the service records the charge and awaits its
+    durable write before this returns, so the stand-down never reads a count the
+    store has not accepted. This is possible because the terminal arm is async;
+    the sync turn-lifecycle hooks that reassign a deadline cannot await and keep
+    their detached write. Best-effort: a monitoring convenience never changes how
+    this turn is reported, so any failure here is swallowed.
+    """
+    if not self_wake:
+        return
+    if getattr(exc, "session_start_failed", False) is True:
+        return
+    if getattr(exc, "structural_terminal", False):
+        return
+    if isinstance(err_meta, dict) and err_meta.get("code") in (
+        "memory_unavailable",
+        "materialization_changed",
+    ):
+        return
+    if not loop_id:
+        # No fired loop identity (not a real self-wake fire): nothing to scope
+        # the charge to, so there is nothing to record.
+        return
+    try:
+        from kiro_crew.autonudge import (
+            get_instance as _autonudge_failed_get,  # circular: autonudge -> dashboard.chat -> chat_runner
+        )
+
+        svc = _autonudge_failed_get()
+        if svc is not None:
+            await svc.notify_cycle_failed(
+                slot_key, loop_id=loop_id, expected_generation=expected_generation
+            )
+    except Exception:
+        logger.debug("autonudge.notify_cycle_failed failed", exc_info=True)
+
+
 def _terminal_error_meta(exc: BaseException) -> dict[str, object] | None:
     """Row-level kind for a terminal ACP error, or None for a plain error row.
 
@@ -20699,6 +20786,23 @@ async def _run_chat(
                 # that can only fail the same way. Read with getattr: the two ACP
                 # exception families tag this fact independently and share no base.
                 _note_cycle_start_failure(slot.key, exc, self_wake=_directive_self_wake)
+                # A cycle that DID reach a model session and dispatched but then
+                # died terminally here -- a backend error after retries were spent,
+                # a persistent tool error, a prompt timeout. The gate (self-wake
+                # only, structural / session-start / pre-dispatch excluded, scoped
+                # to the fired loop's config generation) lives in the helper, which
+                # the generic ``except`` arm below also calls -- a report in only
+                # one arm would miss whichever death the other serves. No row meta
+                # is resolved in this arm (a structural rejection is excluded by its
+                # own ``exc`` tag, and the pre-dispatch classes land in the generic
+                # arm, not here), so ``err_meta`` is None.
+                await _note_cycle_failure(
+                    slot.key,
+                    exc,
+                    self_wake=_directive_self_wake,
+                    loop_id=_directive_loop_id,
+                    expected_generation=_directive_loop_gen,
+                )
                 # This branch ENDS the retry cycle: the error is terminal and
                 # nothing is re-queued. Refresh the transient-5xx budget now so the
                 # NEXT cycle — the Continue press this very error message invites
@@ -20793,6 +20897,34 @@ async def _run_chat(
         # population that runs there. Reporting only in the AcpError branch would
         # leave the loops this bound exists for never backing off.
         _note_cycle_start_failure(slot.key, exc, self_wake=_directive_self_wake)
+        # The SIBLING of the failed-cycle report in the AcpError branch above,
+        # for the same reason the start-failure report is duplicated here: a
+        # cycle that reached a session and dispatched but then died does not
+        # always raise an AcpError. A prompt timeout (AcpRequestTimeout) and a
+        # wedged session (AcpSessionStartTimeout) descend from AcpRuntimeError,
+        # not AcpError, so they land in THIS arm, and an exhausted retry or a
+        # plain Exception does too. Charging the streak only in the AcpError
+        # branch would leave a loop failing this way firing cycle after cycle
+        # that only fails the same way -- the exact waste this bound ends. The
+        # gate is the helper's: same self-wake scope and the structural /
+        # session-start exclusions as the AcpError arm, PLUS the pre-dispatch
+        # exclusion that only this arm needs. A memory store that would not open
+        # (``memory_unavailable``) and a member agent file changed out of band
+        # (``materialization_changed``) never reached a session at all, so the
+        # "reached a session and then died" stand-down -- and the operator notice
+        # that names a backend/tool/timeout cause -- must not fire for them. They
+        # are identified by the ``_err_meta`` resolved just above, passed through
+        # so the helper needs no new classification. A plain internal bug keeps
+        # charging: a self-wake cycle that dispatches and raises the same bug
+        # every interval is exactly the no-progress waste this bound ends.
+        await _note_cycle_failure(
+            slot.key,
+            exc,
+            self_wake=_directive_self_wake,
+            loop_id=_directive_loop_id,
+            expected_generation=_directive_loop_gen,
+            err_meta=_err_meta,
+        )
         if not (isinstance(exc, MemoryStartupUnavailable) and not _memory_preparation_admitted):
             await state.sessions.record_failure(session_key)
     finally:

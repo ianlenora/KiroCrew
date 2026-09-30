@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew import shutdown_event
 from kiro_crew.autonudge_service.model import (
+    _CONSECUTIVE_FAILURE_STANDDOWN_AFTER,
     _START_FAILURE_BACKOFF_AFTER,
     _START_FAILURE_STANDDOWN_AFTER,
     NudgeLoop,
@@ -151,18 +152,91 @@ def notify_cycle_start_failed(self: AutoNudgeService, slot_key: str) -> None:
     self._persist_soon()
 
 
-def notify_cycle_landed(self: AutoNudgeService, slot_key: str) -> None:
-    """Clear *slot_key*'s start-failure streak: a turn on it completed.
+async def notify_cycle_failed(
+    self: AutoNudgeService,
+    slot_key: str,
+    *,
+    loop_id: str,
+    expected_generation: int,
+) -> None:
+    """Record that this loop's own delivered cycle in *slot_key* ended in a fault.
 
-    Any landed turn counts, a human's as much as a cycle's -- the streak is a
-    reading of whether this session can start at all, and a turn that reached
-    completion proves it can. That is the conservative direction: it can only
-    let a loop keep running, never stop one.
+    Called from the chat runner's terminal-error paths when the failure is neither
+    a structural rejection nor a session-start failure and the turn was this
+    loop's own cycle -- a turn that reached a model session and dispatched, then
+    died (``error`` or ``timeout``). Evidence, not inference: the loop spent a
+    turn and it failed, which is the one thing that distinguishes a loop making no
+    progress from a quiet one.
+
+    Only the loop's OWN cycle counts (the chat runner passes the self-wake guard,
+    excluding the structural and session-start cases, before calling this), so a
+    human turn that happened to error on a slot carrying a loop cannot spend the
+    loop's stand-down budget. That is the same guard ``notify_cycle_start_failed``
+    relies on, and for the same reason.
+
+    Scoped to the fired loop by BOTH its id AND its ``config_generation``,
+    captured at fire time (chat_runner passes ``_directive_loop_id`` and
+    ``_directive_loop_gen``), matched under ``_lock`` so there is no TOCTOU
+    window -- the same ``(id, generation)`` fence the structural-terminal verdict
+    is applied under. The id guards the slot-reuse case the generation alone
+    cannot: a loop A on this slot replaced by a fresh loop B that happens to carry
+    the same slot and the same generation (both start at 0) would otherwise take
+    A's stale failure onto B. The generation guards the revision case (A->B->A):
+    a completion whose generation advanced under it describes the OLD instruction
+    and must not stand the revised loop down. Either mismatch is a stale fault and
+    is dropped.
+
+    Durability (persist before you publish): the increment and its durable write
+    happen together under ``_lock`` and the write is AWAITED, so the live
+    ``consecutive_failed_cycles`` the stand-down reads is never a value the store
+    has not yet accepted. The chat runner's terminal arm is async and awaits this,
+    which is what lets it stage-then-write rather than detach the write the way a
+    deadline-reassigning sync hook must. The stand-down DECISION still belongs to
+    ``_timer``, which owns every terminal and scheduling decision and evaluates
+    them serialized before a fire -- this only records the evidence.
+    """
+    async with self._lock:
+        loop = self._loops.get(loop_id)
+        if loop is None or not loop.active or loop.slot_key != slot_key:
+            return
+        if loop.config_generation != expected_generation:
+            # Stale completion of a now-revised loop: the generation advanced
+            # between fire and fault, so this charge belongs to the old
+            # instruction, not the loop live on the slot now.
+            return
+        loop.consecutive_failed_cycles += 1
+        logger.warning(
+            "AutoNudge: loop %s's cycle failed (%d consecutive); it will stand "
+            "down at %d unless a turn lands first",
+            loop.id,
+            loop.consecutive_failed_cycles,
+            _CONSECUTIVE_FAILURE_STANDDOWN_AFTER,
+        )
+        # Awaited under the SAME lock hold: snapshot and write the incremented
+        # value before this returns, so a process exit after the hook cannot
+        # restore a count the store never saw. ``_write_state`` fsyncs, so it is
+        # offloaded to a worker thread exactly as ``_persist_locked`` does rather
+        # than run on the event loop; done inside the hold so the increment and
+        # its write are serialized together and no concurrent writer can land a
+        # payload between them.
+        payload = self._serialize_state()
+        await asyncio.get_running_loop().run_in_executor(None, self._write_state, payload)
+
+
+def notify_cycle_landed(self: AutoNudgeService, slot_key: str) -> None:
+    """Clear *slot_key*'s failure streaks: a turn on it completed.
+
+    Any landed turn counts, a human's as much as a cycle's -- the streaks are a
+    reading of whether this session can start (``consecutive_start_failures``)
+    and make progress (``consecutive_failed_cycles``) at all, and a turn that
+    reached completion proves both. That is the conservative direction: it can
+    only let a loop keep running, never stop one.
     """
     loop = self._find_by_slot(slot_key)
-    if not loop or not loop.consecutive_start_failures:
+    if not loop or not (loop.consecutive_start_failures or loop.consecutive_failed_cycles):
         return
     loop.consecutive_start_failures = 0
+    loop.consecutive_failed_cycles = 0
     # Drop the paid-deferral marker with the streak it belonged to: a streak
     # that climbs back to the same value must pay its own deferral again.
     self._start_failure_deferred.pop(loop.id, None)
