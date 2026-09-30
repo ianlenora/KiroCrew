@@ -165,6 +165,29 @@ def test_a_solo_runtimes_death_is_not_shared():
     assert runtime_death.caused_by_this_session(rt) is True
 
 
+def test_mark_dead_records_and_broadcasts_ambiguous_delivery():
+    """A request-frame drain stall marks the runtime dead with
+    ambiguous_delivery=True; the recorded flag (read by a poison-woken
+    co-tenant) and the broadcast AcpRuntimeDead that fails pending requests both
+    carry it, so recovery resumes from state instead of replaying the buffered
+    frame's prompt (GPT F1 / Opus). Every other death leaves it False."""
+    rt = _runtime(sessions=1)
+    loop = asyncio.new_event_loop()
+    try:
+        fut: asyncio.Future = loop.create_future()
+        rt._pending_requests["r1"] = fut
+        rt._mark_dead("request write stalled after the frame was buffered", ambiguous_delivery=True)
+        assert rt.death_ambiguous_delivery() is True
+        assert fut.done()
+        assert getattr(fut.exception(), "ambiguous_delivery", None) is True
+    finally:
+        loop.close()
+
+    rt2 = _runtime(sessions=1)
+    rt2._mark_dead(rt2._exit_reason(-15))
+    assert rt2.death_ambiguous_delivery() is False
+
+
 def test_a_shared_runtimes_death_is_nobodys_single_failure(caplog):
     """Two ACP sessions on one process is the sub-agent-on-parent shape, and it
     is real at cap 1 -- a sub-agent holds no lease, so the registry cannot see

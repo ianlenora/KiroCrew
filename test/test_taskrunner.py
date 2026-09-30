@@ -1942,6 +1942,168 @@ class TestCheckpointResume:
 
 class TestSessionRecovery:
     @pytest.mark.asyncio
+    async def test_ambiguous_delivery_death_steers_retry_to_resume_not_restart(
+        self, tmp_path: Path
+    ) -> None:
+        """A drain-stall death carries ambiguous_delivery: the buffered step prompt
+        may already have run, so the retry must resume from current state instead
+        of re-stating the task verbatim (which would re-run its tools)."""
+        from kiro_crew.acp.client import AcpProcessDied
+        from kiro_crew.providers.base import LLMEvent
+
+        sessions = _make_mock_sessions()
+        prompts: list[str] = []
+        call_count = 0
+
+        provider = MagicMock()
+
+        async def _ambiguous_then_succeed(msg: str):
+            nonlocal call_count
+            call_count += 1
+            prompts.append(msg)
+            if call_count == 1:
+                raise AcpProcessDied("stdin stalled", ambiguous_delivery=True)
+            yield LLMEvent(kind="text_chunk", text="Resumed!")
+            yield LLMEvent(kind="complete")
+
+        provider.stream = _ambiguous_then_succeed
+        provider.approve_tool = AsyncMock()
+        provider.context_usage_pct = MagicMock(return_value=0.0)
+        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
+
+        async def _on_notify(title: str, body: str, task_id: str = "") -> None:
+            pass
+
+        runner = TaskRunner(
+            sessions=sessions, auto_test=False, on_notify=_on_notify, work_dir=tmp_path
+        )
+        run = TaskRun(spec_path=str(tmp_path / "t.md"), spec_content="s", status="running")
+        step = Step(index=1, title="Create the user table", description="run the migration")
+        run.tasks = [step]
+
+        success = await runner._execute_single_task(run, step)
+
+        assert success
+        assert step.status == StepStatus.PASSED
+        sessions.reset.assert_called()
+        # The retry prompt (second stream call) steers to resume from current
+        # state, not re-run the step. (A later verification turn may also stream.)
+        assert len(prompts) >= 2
+        retry_prompt = prompts[1].lower()
+        assert "do not restart" in retry_prompt
+        assert "already have started" in retry_prompt or "already started" in retry_prompt
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_delivery_persists_resume_hint_before_publishing(
+        self, tmp_path: Path
+    ) -> None:
+        """A drain-stall death sets resume_hint in memory, then persists it before
+        notifying or retrying: without the flush, a gateway restart inside the
+        recovery window reloads an empty hint and the next boot replays the
+        already-executed step verbatim. Assert _apersist_runs runs while the hint
+        is set, not only when the step returns."""
+        from kiro_crew.acp.client import AcpProcessDied
+        from kiro_crew.providers.base import LLMEvent
+
+        sessions = _make_mock_sessions()
+        call_count = 0
+
+        provider = MagicMock()
+
+        async def _ambiguous_then_succeed(msg: str):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise AcpProcessDied("stdin stalled", ambiguous_delivery=True)
+            yield LLMEvent(kind="text_chunk", text="Resumed!")
+            yield LLMEvent(kind="complete")
+
+        provider.stream = _ambiguous_then_succeed
+        provider.approve_tool = AsyncMock()
+        provider.context_usage_pct = MagicMock(return_value=0.0)
+        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
+
+        async def _on_notify(title: str, body: str, task_id: str = "") -> None:
+            pass
+
+        runner = TaskRunner(
+            sessions=sessions, auto_test=False, on_notify=_on_notify, work_dir=tmp_path
+        )
+        run = TaskRun(spec_path=str(tmp_path / "t.md"), spec_content="s", status="running")
+        step = Step(index=1, title="Create the user table", description="run the migration")
+        run.tasks = [step]
+
+        # Record whether the hint was set at each persist call. The recovery flush
+        # happens while resume_hint is populated; a persist seen with the hint set
+        # proves the window is closed.
+        hint_states: list[str] = []
+        real_persist = runner._apersist_runs
+
+        async def _spy_persist() -> None:
+            hint_states.append(step.resume_hint)
+            await real_persist()
+
+        runner._apersist_runs = _spy_persist  # type: ignore[method-assign]
+
+        success = await runner._execute_single_task(run, step)
+
+        assert success
+        assert step.status == StepStatus.PASSED
+        # At least one persist happened while the resume hint was populated —
+        # the recovery-window flush this fix adds.
+        assert any(h and "do not restart" in h.lower() for h in hint_states), hint_states
+
+    @pytest.mark.asyncio
+    async def test_resume_hint_survives_a_failure_before_delivery(self, tmp_path: Path) -> None:
+        """The hint must clear only AFTER the hint-bearing prompt is delivered: if a
+        later turn fails before it streams, the next retry must still carry the
+        resume hint rather than fall back to a verbatim replay."""
+        from kiro_crew.acp.client import AcpProcessDied
+        from kiro_crew.providers.base import LLMEvent
+
+        sessions = _make_mock_sessions()
+        prompts: list[str] = []
+        call_count = 0
+
+        provider = MagicMock()
+
+        async def _ambiguous_then_fail_then_succeed(msg: str):
+            nonlocal call_count
+            call_count += 1
+            prompts.append(msg)
+            if call_count == 1:
+                raise AcpProcessDied("stdin stalled", ambiguous_delivery=True)
+            if call_count == 2:
+                # A plain (non-ambiguous) failure BEFORE any output is streamed:
+                # the hint must still be set for the next retry.
+                raise RuntimeError("transient failure before delivery")
+                yield  # pragma: no cover - unreachable, makes this an async gen
+            yield LLMEvent(kind="text_chunk", text="Resumed!")
+            yield LLMEvent(kind="complete")
+
+        provider.stream = _ambiguous_then_fail_then_succeed
+        provider.approve_tool = AsyncMock()
+        provider.context_usage_pct = MagicMock(return_value=0.0)
+        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
+
+        async def _on_notify(title: str, body: str, task_id: str = "") -> None:
+            pass
+
+        runner = TaskRunner(
+            sessions=sessions, auto_test=False, on_notify=_on_notify, work_dir=tmp_path
+        )
+        run = TaskRun(spec_path=str(tmp_path / "t.md"), spec_content="s", status="running")
+        step = Step(index=1, title="Create the user table", description="run the migration")
+        run.tasks = [step]
+
+        await runner._execute_single_task(run, step)
+
+        # The 3rd attempt's prompt still carries the resume hint, because the 2nd
+        # attempt raised before delivery and the hint was NOT cleared at render.
+        assert len(prompts) >= 3
+        assert "do not restart" in prompts[2].lower()
+
+    @pytest.mark.asyncio
     async def test_process_died_recovers(self, tmp_path: Path) -> None:
         """AcpProcessDied → recovers and completes step."""
         from kiro_crew.acp.client import AcpProcessDied

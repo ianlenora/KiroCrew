@@ -1907,6 +1907,7 @@ class TaskRunner:
                 log_task_fn=self._log_task,
                 extract_lesson_fn=self._extract_lesson,
                 session_key=session_key,
+                on_persist=self._apersist_runs,
                 **({"taskq": handle} if handle is not None else {}),
             )
         except asyncio.CancelledError:
@@ -2919,6 +2920,12 @@ class TaskRunner:
                                 "error": t.error or "",
                                 "result": (t.result or "")[:2000],
                                 "attempts": t.attempts,
+                                # Durable so an ambiguous-delivery resume hint set
+                                # on a crash-recovery retry survives a gateway
+                                # restart; without it a restart in that window
+                                # would restore the task to a verbatim replay of a
+                                # possibly-executed step.
+                                "resume_hint": t.resume_hint or "",
                             }
                             for t in run.tasks
                         ],
@@ -3087,6 +3094,7 @@ class TaskRunner:
                         status=TaskStatus(t["status"]),
                         error=t.get("error", ""),
                         result=t.get("result", ""),
+                        resume_hint=t.get("resume_hint", ""),
                         attempts=t.get("attempts", 1),
                         depends_on=t.get("depends_on", []),
                         requires_approval=t.get("requires_approval", False),

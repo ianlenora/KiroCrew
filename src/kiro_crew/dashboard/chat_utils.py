@@ -3624,7 +3624,12 @@ _CONTINUATION_BY_CAUSE = {
 
 
 def build_recovery_requeue(
-    message: str, turn_emitted: bool, cause: ResetCause, *, message_is_synthetic: bool
+    message: str,
+    turn_emitted: bool,
+    cause: ResetCause,
+    *,
+    message_is_synthetic: bool,
+    ambiguous_delivery: bool = False,
 ) -> tuple[str, RecoveryPayload]:
     """Choose the prompt for a reset-and-requeue recovery, and label its provenance.
 
@@ -3632,6 +3637,14 @@ def build_recovery_requeue(
     can repeat side effects. A continuation instead resumes from restored
     conversation state. Before any output, the original request is safe and is
     still required for the model to begin the work.
+
+    ``ambiguous_delivery`` forces the continuation even BEFORE any output: a
+    request-frame drain stall (see ``AcpProcessDied``) left the prompt in the
+    transport, so a kiro-cli that merely paused reading could have consumed and
+    acted on it without ever producing host-visible output -- the one case
+    ``turn_emitted`` cannot see. Replaying the prompt verbatim there would run its
+    tools a second time, so an ambiguous delivery takes the same safe continuation
+    an emitted turn does.
 
     That decision is the same for every cause, but the continuation is not:
     ``cause`` is required because the marker it carries is what the transcript
@@ -3646,7 +3659,7 @@ def build_recovery_requeue(
     queue entry that produced the turn, and is required for the same reason ``cause``
     is — a requeue site added later must not silently inherit "the user said this".
     """
-    if turn_emitted:
+    if turn_emitted or ambiguous_delivery:
         return _CONTINUATION_BY_CAUSE[cause], RecoveryPayload.CONTINUATION
     return message, payload_for_replay(message_is_synthetic)
 

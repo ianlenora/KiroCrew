@@ -279,7 +279,23 @@ class AcpPermissionNeeded(AcpError):  # noqa: N818
 
 
 class AcpProcessDied(AcpError):  # noqa: N818
-    """kiro-cli process exited unexpectedly."""
+    """kiro-cli process exited unexpectedly.
+
+    ``ambiguous_delivery`` is True when the death followed a request-frame drain
+    stall: the frame had already been handed to the transport, so a kiro-cli that
+    merely paused reading could still consume it after the death is raised. The
+    recovery path must then NOT replay the prompt verbatim (that would run its
+    tools a second time) -- it resumes from restored conversation state instead,
+    the same choice it makes once a turn has emitted output. A write that never
+    reached the transport (a lock-phase stall, a broken pipe before the write)
+    leaves this False: the replay is the frame's first and only delivery.
+    """
+
+    def __init__(self, *args: object, ambiguous_delivery: bool = False, **kwargs: object) -> None:
+        # Forward transient/code to AcpError so AcpRegistrationRateLimited (which
+        # subclasses this and passes transient=True) keeps working.
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self.ambiguous_delivery = ambiguous_delivery
 
 
 class AcpAuthRequired(AcpError):  # noqa: N818
@@ -368,8 +384,8 @@ class AcpRegistrationRateLimited(AcpProcessDied):  # noqa: N818
     behind a death summary is the repetitive wall this type exists to replace.
     """
 
-    def __init__(self, message: str) -> None:
-        super().__init__(message, transient=True)
+    def __init__(self, message: str, *, ambiguous_delivery: bool = False) -> None:
+        super().__init__(message, transient=True, ambiguous_delivery=ambiguous_delivery)
 
 
 class AcpToolGateUnroutable(AcpError):  # noqa: N818
@@ -878,7 +894,9 @@ def is_registration_throttle_output(haystack: str) -> bool:
     return registration_throttle_line(haystack) is not None
 
 
-def registration_rate_limited_error(base: str, cause: str) -> "AcpRegistrationRateLimited":
+def registration_rate_limited_error(
+    base: str, cause: str, *, ambiguous_delivery: bool = False
+) -> "AcpRegistrationRateLimited":
     """Build the typed error for a death whose evidence shows a registration throttle.
 
     ONE composer for every translation site (the shared-runtime ``_died``, the
@@ -890,7 +908,8 @@ def registration_rate_limited_error(base: str, cause: str) -> "AcpRegistrationRa
     return AcpRegistrationRateLimited(
         f"{base} — dynamic registration was rate-limited by the endpoint "
         f"(HTTP 429); this is endpoint throttling, not a crash — retry later. "
-        f"Cause: {cause}"
+        f"Cause: {cause}",
+        ambiguous_delivery=ambiguous_delivery,
     )
 
 

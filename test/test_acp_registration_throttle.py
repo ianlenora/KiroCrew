@@ -156,6 +156,37 @@ def test_died_degrades_on_runtime_without_stderr_tail():
     assert str(exc) == "Runtime process died during prompt"
 
 
+def test_died_carries_recorded_ambiguous_delivery_on_a_poison_woken_cotenant():
+    """A co-tenant woken only by the poison sentinel never saw the stall, but the
+    runtime recorded that the death was an ambiguous drain stall; _died must
+    carry that onto the generic AcpProcessDied so recovery resumes, not replays.
+    (GPT F1 / Opus FINDING: the co-tenant poison path dropped the flag.)"""
+    rt = _ThrottledRuntime("segfault at 0x0")
+    rt.death_ambiguous_delivery = lambda: True
+    exc = _handle(rt)._died("Runtime process died during prompt")
+    assert type(exc) is AcpProcessDied
+    assert exc.ambiguous_delivery is True
+
+
+def test_died_throttle_subclass_carries_recorded_ambiguous_delivery():
+    """The pre-work throttle branch of _died returns an AcpRegistrationRateLimited
+    that subclasses AcpProcessDied and is caught by the same replay-deciding
+    handlers, so it too must carry the recorded ambiguous-delivery flag."""
+    rt = _ThrottledRuntime("\n".join([_THROTTLE_LINE] * 3))
+    rt.death_ambiguous_delivery = lambda: True
+    exc = _handle(rt)._died("Runtime process died during prompt")
+    assert isinstance(exc, AcpRegistrationRateLimited)
+    assert exc.ambiguous_delivery is True
+
+
+def test_died_defaults_ambiguous_delivery_false_without_the_hook():
+    """A runtime double without death_ambiguous_delivery fails closed (False) —
+    the getattr guard never widens the replay-suppressing flag."""
+    exc = _handle(_ThrottledRuntime("segfault at 0x0"))._died("died")
+    assert type(exc) is AcpProcessDied
+    assert exc.ambiguous_delivery is False
+
+
 # ── session_provider._translate_dead ──
 
 
@@ -213,6 +244,44 @@ def test_translate_dead_stays_generic_without_the_signature():
     runtime.redacted_stderr_tail.return_value = "reader crashed"
     exc = _provider(runtime)._translate_dead(AcpRuntimeDead("process exited (rc=1)"))
     assert type(exc) is AcpProcessDied
+
+
+def test_translate_dead_carries_ambiguous_delivery_onto_the_process_died():
+    """A drain-stall death flagged ambiguous_delivery must keep that flag through
+    translation, so the recovery path suppresses a verbatim prompt replay."""
+    from unittest.mock import MagicMock
+
+    from kiro_crew.acp.runtime import AcpRuntimeDead
+
+    runtime = MagicMock()
+    runtime.saw_not_logged_in.return_value = False
+    runtime.redacted_stderr_tail.return_value = ""
+    ambiguous = _provider(runtime)._translate_dead(
+        AcpRuntimeDead("stdin stalled", ambiguous_delivery=True)
+    )
+    assert type(ambiguous) is AcpProcessDied
+    assert ambiguous.ambiguous_delivery is True
+    plain = _provider(runtime)._translate_dead(AcpRuntimeDead("process exited (rc=1)"))
+    assert plain.ambiguous_delivery is False
+
+
+def test_translate_dead_throttle_branch_preserves_ambiguous_delivery():
+    """The throttle branch returns an AcpRegistrationRateLimited (a subclass of
+    AcpProcessDied caught by the same replay-deciding handlers), so it keeps the
+    ambiguous-delivery flag an ambiguous drain-stall death carries."""
+    from unittest.mock import MagicMock
+
+    from kiro_crew.acp.runtime import AcpRuntimeDead
+
+    runtime = MagicMock()
+    runtime.saw_not_logged_in.return_value = False
+    runtime.redacted_stderr_tail.return_value = "\n".join([_THROTTLE_LINE] * 3)
+    exc = _provider(runtime)._translate_dead(
+        AcpRuntimeDead("stdin stalled", ambiguous_delivery=True)
+    )
+    assert isinstance(exc, AcpRegistrationRateLimited)
+    assert exc.transient is True
+    assert exc.ambiguous_delivery is True
 
 
 # ── activity latch: classification is pre-work only ──

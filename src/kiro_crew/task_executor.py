@@ -10,7 +10,7 @@ import asyncio
 import logging
 import time as _time
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from kiro_crew import git_coord, name_grant, platform_compat, runtime_death, shutdown_event
 from kiro_crew.acp.client import AcpProcessDied
@@ -193,6 +193,7 @@ async def execute_single_task(
     extract_lesson_fn: Callable,
     session_key: str = "",
     taskq: "Admitted | None" = None,
+    on_persist: Callable | None = None,
 ) -> bool:
     """Execute one task with approval gate, self-review, and memory update.
 
@@ -203,7 +204,9 @@ async def execute_single_task(
     """
     if not session_key:
         session_key = f"{SESSION_PREFIX}:{run.task_id}:task{task.index}"
-    _exec_kw = {"taskq": taskq} if taskq is not None else {}
+    _exec_kw: dict[str, Any] = {"taskq": taskq} if taskq is not None else {}
+    if on_persist is not None:
+        _exec_kw["on_persist"] = on_persist
 
     task.status = TaskStatus.IN_PROGRESS
     now = _time.time()
@@ -397,6 +400,7 @@ async def execute_task(
     on_notify: Callable,
     session_key: str = "",
     taskq: "Admitted | None" = None,
+    on_persist: Callable | None = None,
 ) -> bool:
     """Execute a single task with retries and process recovery.
 
@@ -802,6 +806,13 @@ async def execute_task(
 
             final_result = result_prefix + result_text
             task.result = redact_credentials(redact_exfiltration_urls(final_result)[0])[0]
+            # The resume hint has now been DELIVERED: the stream loop ran, so the
+            # hint-bearing prompt reached the agent. Clear it only here, not at
+            # render time -- clearing at render would drop it if any of the
+            # failable awaits between build and delivery (embed pool, spec hooks)
+            # raised, silently returning the step to a verbatim replay of
+            # possibly-executed tools.
+            task.resume_hint = ""
             # A stream that ended without any EVENT_COMPLETE proves nothing: the
             # provider never said the turn finished, so it is not a PASSED step
             # (the classifier below would read the absent reason as a normal
@@ -868,7 +879,7 @@ async def execute_task(
             except Exception:
                 logger.debug("usage row (taskrunner) persist failed", exc_info=True)
 
-        except AcpProcessDied:
+        except AcpProcessDied as _died_exc:
             # Whose failure was this? A task runs its sub-agents on its own
             # runtime, so a death here can be a process event several accounts
             # witnessed rather than this task's fault -- and MAX_RECOVERIES then
@@ -921,6 +932,36 @@ async def execute_task(
                     f"Process crashed. Partial output before crash:\n"
                     f"{partial[:500]}\n\nContinue from where you left off."
                 )
+            if getattr(_died_exc, "ambiguous_delivery", False):
+                # The death followed a request-frame drain stall: the step's
+                # prompt had reached the transport and a kiro-cli that merely
+                # paused reading could already have consumed and acted on it.
+                # Re-stating the task verbatim would re-run its (possibly
+                # non-idempotent) tools, so steer the NEXT attempt to resume from
+                # the CURRENT repository/session state instead. Set INDEPENDENTLY
+                # of the partial branch -- a second ambiguous death after some
+                # output is still an ambiguous delivery and must re-arm the hint.
+                # Carried in resume_hint, not task.error, because the death path
+                # keeps the same attempt number and build_task_prompt only renders
+                # task.error at attempt > 1 -- the hint renders unconditionally and
+                # is cleared only after the turn is delivered (see above). Mirrors
+                # the dashboard chat runner's ambiguous-delivery continuation.
+                task.resume_hint = (
+                    "The previous attempt's instruction may already have started "
+                    "executing before the process died, with no output recorded. "
+                    "Do NOT restart from scratch: first inspect the current "
+                    "repository and session state to see what already happened, "
+                    "then complete only the part of this task that is not yet done."
+                )
+                # Persist the hint durably before publishing or retrying: the
+                # run snapshot that carries resume_hint is otherwise taken only
+                # when the step returns, so a gateway restart inside the recovery
+                # window reloads an empty hint and the next boot replays the
+                # (possibly non-idempotent) step verbatim. on_persist flushes the
+                # already-existing durable field; the recovery path is off the
+                # hot path, so the extra await costs nothing a successful step pays.
+                if on_persist is not None:
+                    await on_persist()
             await on_notify(
                 f"💀 Task {task.index}: process died",
                 f"Recovering ({_death_attempts}/{MAX_RECOVERIES})…",
@@ -1289,6 +1330,15 @@ async def build_task_prompt(run: Project, task: Task, attempt: int, work_dir: Pa
             f"\n## Previous Attempt Failed (attempt {attempt - 1})\n"
             f"Error: {task.error}\n\nFix the error and try again.\n"
         )
+
+    # Rendered regardless of attempt count: an ambiguous-delivery process death
+    # keeps the same attempt number, so this cannot ride on the attempt > 1 guard
+    # above. NOT cleared here -- the prompt still has to pass through several
+    # failable awaits (embed pool, spec hooks) before it is delivered, and a raise
+    # in that window must leave the hint set so the next retry still carries it.
+    # It is cleared only after the turn lands (see execute_task).
+    if task.resume_hint:
+        parts.append(f"\n## Resume (do not restart)\n{task.resume_hint}\n")
 
     wd = run.work_dir or str(work_dir)
     if run.branch_name:

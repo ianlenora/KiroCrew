@@ -867,7 +867,6 @@ test/test_tailnet_e2e.py
 test/test_tailnet_origin.py
 test/test_tailnet_serve.py
 test/test_tailnet_session_url.py
-test/test_taskrunner_atomic_persistence.py
 test/test_taskrunner_autoapprove.py
 test/test_taskrunner_v2_scenarios.py
 test/test_tcc_protected_dirs.py

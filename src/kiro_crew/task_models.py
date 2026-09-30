@@ -44,6 +44,11 @@ class Task:
     attempts: int = 0
     error: str = ""
     result: str = ""
+    # A one-shot "resume, do not restart" instruction rendered on the NEXT
+    # attempt regardless of attempt count. Set after an ambiguous-delivery
+    # process death (the step's prompt may already have run with no output), and
+    # cleared once consumed so it never leaks into an unrelated later attempt.
+    resume_hint: str = ""
     requires_approval: bool = False
     force_approval: bool = False  # blocks even in YOLO mode
     depends_on: list[int] = field(default_factory=list)

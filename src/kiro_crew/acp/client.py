@@ -133,10 +133,12 @@ from kiro_crew.acp.transport_errors import (
     sandbox_init_failure,
 )
 from kiro_crew.acp.transport_framing import (
-    _RESPONSE_WRITE_MIN_PROGRESS_BYTES,
     _STDOUT_BUFFER_LIMIT,
+    RequestWriteResult,
+    _stall_window_phrase,
     response_write_window_secs,
     write_notification_best_effort,
+    write_request_frame_bounded,
     write_response_frame_bounded,
 )
 from kiro_crew.acp.types import (
@@ -9736,16 +9738,75 @@ class AcpClient:
         req = JsonRpcRequest(method=method, params=params, id=req_id)
         data = json.dumps(req.to_dict()) + "\n"
         try:
-            # Under the write lock so a response frame waiting behind this
-            # (caller-sized, deliberately unbounded) frame measures the
-            # reader's progress exactly; see await_under_no_progress_bound.
-            async with self._stdin_write_lock():
-                self._process.stdin.write(data.encode())
-                await self._process.stdin.drain()
+            # Bounded on the reader's PROGRESS, not held across a raw drain: a
+            # request write that parks while the backend is flow-control-paused
+            # must not hold the write lock (acute on the shared runtime, where a
+            # co-tenant waits behind the lock, but a single session can self-wedge
+            # too). A stall raises AcpProcessDied, the same recovery a closed pipe
+            # already gets.
+            await self._write_request_bounded(data.encode(), req_id, method)
         except (BrokenPipeError, ConnectionResetError) as exc:
             raise AcpProcessDied(f"ACP process pipe broken: {exc}") from exc
         self._last_activity = time.monotonic()
         return req_id
+
+    async def _write_request_bounded(self, data: bytes, request_id: int, method: str) -> None:
+        """Write a REQUEST frame under the write lock and the same no-progress bound.
+
+        The request twin of :meth:`_write_response_bounded`. A request frame is
+        caller-sized (a prompt may carry any number of image blocks), which is
+        why the bound is on the reader's PROGRESS rather than on elapsed time: a
+        reader still consuming keeps the wait alive, and only a writer whose
+        buffer has not shrunk for ``_RESPONSE_WRITE_BOUND_SECS`` is the
+        reader-gone stall. Holding the write lock across an unbounded ``drain()``
+        here would let a flow-control-paused backend park it forever WITH the
+        lock held; on the shared runtime that wedges every co-tenant session
+        behind the lock at 0 CPU. A stall is mapped to
+        ``AcpProcessDied`` so the caller takes the existing session-reset +
+        bounded-requeue recovery.
+
+        A DRAIN_STALL can leave the frame buffered in a backend that resumes
+        reading, but the kill-and-reap that would try to make delivery impossible
+        is NOT done here: it cannot be guaranteed (a close/EOF keeps flushing the
+        buffered bytes, and a wedged child is exactly the one that fails to exit
+        within the grace, so death is not confirmed before the raise), and on the
+        shared runtime it would bypass the ownership authorization and terminate
+        sibling sessions. Instead a DRAIN_STALL raises ``AcpProcessDied`` with
+        ``ambiguous_delivery`` set, which ``build_recovery_requeue`` reads to
+        resume from restored state rather than replay a prompt the backend may
+        have consumed; a LOCK_STALL wrote no byte, so it is not ambiguous and its
+        replay is safe. The phase appears only in the log.
+        """
+        assert self._process is not None and self._process.stdin is not None
+        result = await write_request_frame_bounded(
+            self._process.stdin,
+            self._stdin_write_lock(),
+            data,
+            bound_secs=transport_framing._RESPONSE_WRITE_BOUND_SECS,
+        )
+        if result is RequestWriteResult.OK:
+            return
+        safe_id = _loggable_request_id(request_id)
+        window = response_write_window_secs(
+            self._process.stdin, transport_framing._RESPONSE_WRITE_BOUND_SECS
+        )
+        logger.warning(
+            "ACP stdin stalled: %s while sending request method=%s req=%s; "
+            "treating the backend as dead (%s)",
+            _stall_window_phrase(self._process.stdin, window),
+            _loggable_request_id(method),
+            safe_id,
+            (
+                "frame never written"
+                if result is RequestWriteResult.LOCK_STALL
+                else "frame already buffered"
+            ),
+        )
+        raise AcpProcessDied(
+            f"ACP stdin stalled: no write progress for {window:g}s while "
+            f"sending request req={safe_id}",
+            ambiguous_delivery=result is RequestWriteResult.DRAIN_STALL,
+        )
 
     def _stdin_write_lock(self) -> asyncio.Lock:
         """The one lock every stdin write on this client takes (see
@@ -9782,10 +9843,9 @@ class AcpClient:
             self._process.stdin, transport_framing._RESPONSE_WRITE_BOUND_SECS
         )
         logger.warning(
-            "ACP stdin stalled: no write progress for %gs (floor %d bytes/window) while "
+            "ACP stdin stalled: %s while "
             "delivering response to req=%s; treating the backend as dead",
-            window,
-            _RESPONSE_WRITE_MIN_PROGRESS_BYTES,
+            _stall_window_phrase(self._process.stdin, window),
             safe_id,
         )
         raise AcpProcessDied(
@@ -13692,6 +13752,7 @@ _EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
         "OversizeLineUnrecoverable",
         "_drain_oversize_line",
         "_RESPONSE_WRITE_BOUND_SECS",
+        "_RESPONSE_WRITE_MIN_PROGRESS_BYTES",
         "_RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS",
         "_is_proactor_loop",
         "_level_is_progress_signal",
@@ -13936,6 +13997,7 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
     from kiro_crew.acp.transport_framing import (  # noqa: F401
         _OVERSIZE_DRAIN_MAX_BYTES,
         _RESPONSE_WRITE_BOUND_SECS,
+        _RESPONSE_WRITE_MIN_PROGRESS_BYTES,
         _RESPONSE_WRITE_UNOBSERVABLE_BOUND_SECS,
         OversizeLineUnrecoverable,
         _drain_oversize_line,

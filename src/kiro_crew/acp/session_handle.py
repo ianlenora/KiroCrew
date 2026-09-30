@@ -733,7 +733,19 @@ class AcpRuntimeError(Exception):
 
 
 class AcpRuntimeDead(AcpRuntimeError):
-    """Raised when the underlying process has died."""
+    """Raised when the underlying process has died.
+
+    ``ambiguous_delivery`` is True when the death followed a request-frame drain
+    stall whose bytes had already reached the transport (see
+    :class:`AcpProcessDied` for the recovery consequence); it rides through
+    ``AcpSessionProvider._translate_dead`` onto the ``AcpProcessDied`` the caller
+    recovers from. False for every other death, including a lock-phase stall that
+    wrote nothing.
+    """
+
+    def __init__(self, *args: object, ambiguous_delivery: bool = False) -> None:
+        super().__init__(*args)
+        self.ambiguous_delivery = ambiguous_delivery
 
 
 class AcpFrameTooLarge(AcpRuntimeError):
@@ -1373,13 +1385,23 @@ class AcpSessionHandle:
         sandbox corroboration reads it. The typed message keeps one retained
         cause instead of the tail's repeated copies.
         """
+        # A co-tenant woken only by its poison sentinel never saw the stall that
+        # killed the runtime; the runtime recorded whether that death was an
+        # ambiguous drain stall (bytes already in the transport), and this
+        # session must carry that onto the death it raises so its recovery
+        # resumes from state rather than replaying a prompt a paused kiro-cli
+        # could still consume. getattr-guarded for a minimal runtime double.
+        ambiguous = getattr(self._runtime, "death_ambiguous_delivery", lambda: False)()
         if not self._prompt_or_tool_seen:
             tail = getattr(self._runtime, "redacted_stderr_tail", lambda: "")()
             cause = registration_throttle_line(tail) if tail else None
             if cause is not None:
-                return registration_rate_limited_error(base, cause)
+                return registration_rate_limited_error(base, cause, ambiguous_delivery=ambiguous)
         summary = getattr(self._runtime, "death_summary", lambda: None)()
-        return AcpProcessDied(f"{base} — {summary}" if summary else base)
+        return AcpProcessDied(
+            f"{base} — {summary}" if summary else base,
+            ambiguous_delivery=ambiguous,
+        )
 
     @property
     def is_turn_active(self) -> bool:

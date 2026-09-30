@@ -39,6 +39,21 @@ def _make_run(task_id: str = "t1") -> TaskRun:
 
 
 class TestPersistRoundTrip:
+    def test_resume_hint_round_trips(self, tmp_path: Path) -> None:
+        """An ambiguous-delivery resume hint set on a crash-recovery retry must
+        survive a gateway restart, or a restore returns the task to a verbatim
+        replay of a possibly-executed step."""
+        runner = _make_runner(tmp_path)
+        run = _make_run()
+        run.tasks[0].resume_hint = "Do NOT restart; inspect current state first."
+        runner._runs[run.task_id] = run
+        runner._persist_runs()
+
+        reloaded = _make_runner(tmp_path)
+        reloaded._load_runs()
+        back = reloaded._runs["t1"].tasks[0]
+        assert back.resume_hint == "Do NOT restart; inspect current state first."
+
     def test_persist_writes_valid_json(self, tmp_path: Path) -> None:
         runner = _make_runner(tmp_path)
         runner._runs[_make_run().task_id] = _make_run()
@@ -127,9 +142,7 @@ class TestGitWorkspaceIdentitySurvivesRestart:
             "short-circuits and never validates the workspace"
         )
 
-    def test_a_legacy_entry_does_not_enable_git_without_an_identity(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_legacy_entry_does_not_enable_git_without_an_identity(self, tmp_path: Path) -> None:
         """An entry written before these fields were persisted carries none of
         them. `git_enabled` must NOT come back at its `True` default there: git
         ops enabled while nothing records which worktree they target is the one
@@ -354,11 +367,17 @@ class TestConcurrentPersist:
         older = json.dumps([{"task_id": "older"}])
 
         runner._commit_snapshot(5, newer)
-        assert json.loads((tmp_path / "runs.json").read_text(encoding="utf-8"))[0]["task_id"] == "newer"
+        assert (
+            json.loads((tmp_path / "runs.json").read_text(encoding="utf-8"))[0]["task_id"]
+            == "newer"
+        )
 
         # Older sequence arriving late is ignored.
         runner._commit_snapshot(3, older)
-        assert json.loads((tmp_path / "runs.json").read_text(encoding="utf-8"))[0]["task_id"] == "newer"
+        assert (
+            json.loads((tmp_path / "runs.json").read_text(encoding="utf-8"))[0]["task_id"]
+            == "newer"
+        )
 
     def test_apersist_snapshots_on_caller_thread(self, tmp_path: Path) -> None:
         """_apersist_runs must build the snapshot before offloading, so the
@@ -400,7 +419,9 @@ class TestAsyncMutationPersistence:
 
 class TestBackgroundStartAdmission:
     def test_concurrent_starts_are_serialized_and_get_unique_ids(
-        self, tmp_path: Path, monkeypatch,
+        self,
+        tmp_path: Path,
+        monkeypatch,
     ) -> None:
         """Persistence yields must not let starts overwrite task/run tracking."""
         spec = tmp_path / "same-spec.md"

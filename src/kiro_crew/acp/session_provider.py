@@ -694,12 +694,23 @@ class AcpSessionProvider(LLMProvider):
                 host_auth.signed_out_message(self._runtime.acp_backend),
                 backend=self._runtime.acp_backend,
             )
+        # Read the ambiguous-delivery flag ONCE, up front, so every branch below
+        # that returns an AcpProcessDied (or its throttle subclass) preserves it.
+        # A drain-stall death whose frame was buffered must resume-from-state
+        # rather than replay (which would re-run its tools); the throttle branch
+        # below returns an AcpRegistrationRateLimited that subclasses
+        # AcpProcessDied and is caught by the same handlers, so dropping the flag
+        # there would license exactly the replay the flag exists to prevent.
+        # getattr fails CLOSED (False) for any death that never set it.
+        ambiguous = getattr(exc, "ambiguous_delivery", False)
         if not getattr(getattr(self, "_handle", None), "prompt_or_tool_seen", True):
             tail = getattr(self._runtime, "redacted_stderr_tail", lambda: "")()
             cause = registration_throttle_line(tail) if tail else None
             if cause is not None:
-                return registration_rate_limited_error(str(exc), cause)
-        return AcpProcessDied(str(exc))
+                return registration_rate_limited_error(
+                    str(exc), cause, ambiguous_delivery=ambiguous
+                )
+        return AcpProcessDied(str(exc), ambiguous_delivery=ambiguous)
 
     async def _guarded(self, awaitable: Any) -> Any:
         """Await a runtime-touching handle coroutine, translating AcpRuntimeDead

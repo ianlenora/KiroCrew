@@ -19491,6 +19491,10 @@ async def _run_chat(
                 _turn_emitted,
                 cause=ResetCause.CONNECTION_LOST,
                 message_is_synthetic=_is_synthetic,
+                # A request-frame drain stall may have delivered the buffered
+                # prompt to a kiro-cli that resumed reading; replaying it verbatim
+                # would run its tools twice. Resume from restored state instead.
+                ambiguous_delivery=getattr(exc, "ambiguous_delivery", False),
             )
             _queue_recovery(
                 0,
