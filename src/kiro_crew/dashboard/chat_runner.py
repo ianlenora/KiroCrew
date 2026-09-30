@@ -4894,17 +4894,22 @@ async def _deliver_linked_slack_message(
 def cross_surface_withheld(state: Any, slot: Any) -> bool:
     """Whether *slot*'s turn must NOT publish its reply to a linked channel.
 
-    True when a peer steered this turn and the containment holding NOW is not the
-    containment that steer was admitted under. Evaluated HERE, synchronously with the
-    publication it guards, which is the only place the answer cannot go stale:
-    :func:`_deliver_cross_surface_reply` resolves the mirror live, so a link bound at
-    any point before this moment is effective, and a reply already sent cannot be
-    recalled.
+    True when the containment holding NOW is not the containment an admission this
+    turn rests on was made under -- a peer steered this turn, or this turn was
+    ADMITTED to a session-control verb or a work-ledger route (the caller-side
+    gates record the caller's own containment through
+    ``session_control.record_audience_admission``, since what those return -- a
+    peer's transcript, a roster, a ledger -- becomes part of the reply). Evaluated
+    HERE, synchronously with the publication it guards, which is the only place the
+    answer cannot go stale: :func:`_deliver_cross_surface_reply` resolves the mirror
+    live, so a link bound at any point before this moment is effective, and a reply
+    already sent cannot be recalled.
 
-    The sender cannot answer this on its own behalf. It records the admission before
-    its RPC and keeps it for the whole turn, because a check it runs when the RPC
-    returns says nothing about a mirror bound between then and the reply. So the
-    sender's job is to record and to stop the turn on what it can see; the decision
+    Neither writer can answer this on its own behalf. A sender records the admission
+    before its RPC and keeps it for the whole turn, because a check it runs when the
+    RPC returns says nothing about a mirror bound between then and the reply; a reader
+    records and returns, and its reply publishes later still. So the writer's job is
+    to record (and, for a steer, to stop the turn on what it can see); the decision
     about publishing belongs to the publisher.
 
     Costs the channel audience nothing when nothing moved -- the comparison is exact
@@ -19369,8 +19374,8 @@ async def _run_chat(
         if not is_slash:
             if cross_surface_withheld(state, slot):
                 logger.info(
-                    "withholding cross-surface reply for %s: %d unresolved steer "
-                    "audience fence(s)",
+                    "withholding cross-surface reply for %s: %d unresolved audience "
+                    "fence(s) (peer steers into, or transcript reads by, this turn)",
                     session_key,
                     len(slot._steer_audience_fences),
                 )
@@ -21162,7 +21167,8 @@ async def _run_chat(
         # individually cancellable — a user who meant "discard" clicks ✕;
         # nothing is ever silently lost.
         _requeue_unconsumed_steers(state, slot)
-        # Drop the peer-steer admissions with the turn they belonged to. They govern
+        # Drop the audience admissions with the turn they belonged to -- the peer
+        # steers admitted into it and the transcript reads it made. They govern
         # whether THIS turn may publish across surfaces, which is their whole job;
         # carrying them further would judge a later turn by an authorization that was
         # never about it. Cleared unconditionally, so a hard stop, a crash or a

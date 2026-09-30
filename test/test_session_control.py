@@ -4384,7 +4384,7 @@ def test_a_mirror_link_landing_during_the_await_still_refuses(tmp_path, monkeypa
     """Eligibility decided before a suspension point says nothing at allocation time.
 
     The project directory is resolved in a worker thread, so the coroutine suspends
-    between the caller gate and the allocation. `_has_channel_mirror` reads the live
+    between the caller gate and the allocation. The caller gate reads the live
     session store, and a dashboard-born session can be given an outbound mirror link
     at any moment -- so a link registered inside that window would otherwise let a
     now-channel-backed caller publish a persistent session outside its containment.
@@ -4395,14 +4395,12 @@ def test_a_mirror_link_landing_during_the_await_still_refuses(tmp_path, monkeypa
     state = _make_state(tmp_path)
     caller = _slot(state, "chat-1")
     before = set(state._slots)
-    mirrored = {"now": False}
-
-    monkeypatch.setattr(sc, "_has_channel_mirror", lambda _state, _slot: mirrored["now"])
 
     def _resolve_then_mirror(_workspace):
         # Stand in for the interleaving: the mirror link lands while the project
-        # directory is still being resolved off-loop.
-        mirrored["now"] = True
+        # directory is still being resolved off-loop -- in the store the gate's
+        # re-assert reads, so it is the row that read sees.
+        state.sessions.set_mirror_link(_key(caller), "C0FFEE", "1758.0003")
         return str(tmp_path)
 
     monkeypatch.setattr(sc, "default_project_dir", _resolve_then_mirror)
