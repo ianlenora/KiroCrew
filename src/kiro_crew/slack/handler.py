@@ -112,6 +112,7 @@ from kiro_crew.messaging.dispatch import (
     await_replay_gap,
     consume_reinjection,
     rearm_reinjection,
+    rollback_skill_bodies,
     session_stop_generation,
     stop_reason_landed,
 )
@@ -4944,6 +4945,7 @@ async def handle_message(
         # error arm, a cancel) discarded the prompt carrying the re-injected
         # context; put the flag back so the next turn re-injects it.
         rearm_reinjection(sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed)
+        rollback_skill_bodies(context_builder, session_key, landed=_turn_landed)
         # The permit is held past this ``finally`` when the turn reached a clean
         # model completion, because success/failure accounting is booked only
         # after the answer-carrying delivery below and mutates per-session breaker

@@ -250,6 +250,7 @@ from kiro_crew.messaging.dispatch import (
     build_tool_gate,
     consume_reinjection,
     rearm_reinjection,
+    rollback_skill_bodies,
     stop_reason_landed,
 )
 from kiro_crew.messaging.display_safety import redact_for_display
@@ -6039,6 +6040,9 @@ class GatewayOrchestrator:
                             consumed=_seq_reinjection,
                             landed=_seq_landed,
                         )
+                        rollback_skill_bodies(
+                            self.ctx_builder, agent_session_key, landed=_seq_landed
+                        )
                         if _acq:
                             self.sessions.release(agent_session_key)
                             # Mirror the single-agent finally below: defer the
@@ -7036,6 +7040,7 @@ class GatewayOrchestrator:
                 rearm_reinjection(
                     self.sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed
                 )
+                rollback_skill_bodies(self.ctx_builder, session_key, landed=_turn_landed)
                 if _acquired:
                     self.sessions.release(session_key)
                     # Defer session reset if subagents are still running,

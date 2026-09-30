@@ -75,6 +75,7 @@ from kiro_crew.messaging.dispatch import (
     predecessor_sid,
     rearm_reinjection,
     requested_model_sid,
+    rollback_skill_bodies,
     slot_workspace,
 )
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
@@ -1652,6 +1653,7 @@ class TelegramDispatcher:
             rearm_reinjection(
                 self.sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed
             )
+            rollback_skill_bodies(self.ctx_builder, session_key, landed=_turn_landed)
             # Always finalize the placeholder (no perma-"🤔 …"), even if
             # get_or_create raised before the semaphore was held. Only release
             # the semaphore if we actually acquired it.
