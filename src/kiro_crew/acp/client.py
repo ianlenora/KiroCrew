@@ -7804,6 +7804,13 @@ class AcpClient:
             self._native_skill_projection = await asyncio.to_thread(
                 prepare_native_skill_projection, self._work_dir, per_session_element=False
             )
+            if self._native_skill_projection is not None:
+                # The agent this process is launched as: its own FIRST ``set_mode``
+                # activation is tolerated even with no prepared view (see
+                # NativeSkillProjection.request), which consumes the exemption --
+                # so a later switch, including back to this same agent once its
+                # view has vanished, takes the strict resolver and fails closed.
+                self._native_skill_projection.spawn_agent_name = self._agent
             argv = [
                 kiro_bin,
                 KIRO_CLI_SUBCMD,

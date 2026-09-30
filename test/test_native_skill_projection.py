@@ -175,6 +175,57 @@ def test_transport_keeps_original_agent_identity_and_rejects_unprepared_modes():
         prepared.request("session/set_mode", {"modeId": "unknown"})
 
 
+def test_set_mode_activates_the_launched_agent_without_a_view_then_consumes_it():
+    """The launched agent's FIRST activation passes; it is then consumed; other
+    unprepared modes never pass.
+
+    The direct-client startup activates the agent with ``session/set_mode``. When
+    that agent has no prepared view, refusing its activation would strand a valid
+    startup, so the request path tolerates the modeId that equals the recorded
+    ``spawn_agent_name`` -- and only that one, and only ONCE. The first tolerated
+    activation consumes the exemption, so a later switch back to the same agent
+    takes the strict resolver and fails closed if its view is still absent -- no
+    reactivating a cached spec the strict resolver existed to refuse.
+    """
+    prepared = projection.NativeSkillProjection({"custom": "native-alias"})
+    prepared.spawn_agent_name = "kirocrew"
+    activated = prepared.request("session/set_mode", {"sessionId": "s", "modeId": "kirocrew"})
+    assert activated["modeId"] == "kirocrew"
+    # The exemption is spent: a second activation of the same agent fails closed.
+    assert prepared.spawn_agent_name == ""
+    with pytest.raises(ValueError, match="no prepared"):
+        prepared.request("session/set_mode", {"modeId": "kirocrew"})
+    # A prepared agent still maps to its alias.
+    assert prepared.request("session/set_mode", {"modeId": "custom"})["modeId"] == "native-alias"
+    # Any OTHER unprepared mode is still rejected, launched agent set or not.
+    with pytest.raises(ValueError, match="no prepared"):
+        prepared.request("session/set_mode", {"modeId": "some-other-agent"})
+
+
+def test_frame_keeps_the_launched_agent_mode_in_available_modes_until_consumed():
+    """A no-view launched agent's own mode must stay in projected availableModes
+    until its initial set_mode is consumed.
+
+    The direct-client start reads the session reply's availableModes BEFORE it
+    sends set_mode. If the launched agent has no prepared view, dropping its mode
+    from availableModes would advertise no mode the process could activate and
+    fail the start during initialization. Keep it while the exemption is live;
+    once consumed (spawn_agent_name cleared), an unprojected agent is hidden
+    again, so the exemption does not permanently widen the advertised set.
+    """
+    prepared = projection.NativeSkillProjection({}, spawn_agent_name="kirocrew")
+    kept = prepared.frame(
+        {"availableModes": [{"id": "kirocrew", "name": "kirocrew"}, {"id": "stranger"}]}
+    )
+    # The launched agent's mode survives; an unprojected stranger does not.
+    assert kept["availableModes"] == [{"id": "kirocrew", "name": "kirocrew"}]
+    # After the initial set_mode consumes the exemption, the mode is hidden again.
+    prepared.request("session/set_mode", {"modeId": "kirocrew"})
+    assert prepared.spawn_agent_name == ""
+    after = prepared.frame({"availableModes": [{"id": "kirocrew", "name": "kirocrew"}]})
+    assert after["availableModes"] == []
+
+
 @pytest.mark.parametrize(
     "command", ["/agent swap custom", {"command": "agent", "args": {"value": "swap custom"}}]
 )
@@ -253,6 +304,111 @@ def test_explicit_search_exclusion_fails_only_that_agent(native_tree):
         prepared.agent("custom")
 
 
+def test_refused_spec_registers_its_stem_so_a_stem_address_stays_refused(native_tree, monkeypatch):
+    """A spec refused into ``errors`` must still have its filename stem recorded.
+
+    The stem is registered the moment the spec reads, BEFORE the validation branch
+    that refuses it. So an agent whose spec excludes skill_search -- refused into
+    ``errors`` by name -- is still refused when reached by its (different) filename
+    stem, instead of the stem slipping through untranslated around the refusal.
+    """
+    _home, agents, project = native_tree
+    monkeypatch.setattr(
+        projection,
+        "list_agents",
+        lambda **kw: [
+            SimpleNamespace(name="refused-agent", filename="refused-stem.json", scope="global")
+        ],
+    )
+    (agents / "refused-stem.json").write_text(
+        json.dumps(
+            {
+                "name": "refused-agent",
+                "resources": ["skill://skills/a/SKILL.md"],
+                "excludedTools": ["@kirocrew-core/skill_search"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    prepared = projection.prepare_native_skill_projection(project)
+    assert prepared.stems.get("refused-stem") == "refused-agent"
+    # Both the name and its stem hit the SAME authored refusal, not a pass-through.
+    with pytest.raises(ValueError, match="explicitly excluded"):
+        prepared.agent("refused-agent")
+    with pytest.raises(ValueError, match="explicitly excluded"):
+        prepared.agent("refused-stem")
+    with pytest.raises(ValueError, match="explicitly excluded"):
+        prepared.spawn_agent("refused-stem")
+
+
+def test_existing_unreadable_spec_is_refused_not_passed_through(native_tree, monkeypatch):
+    """A discovered spec that cannot be READ is refused, closing the bypass.
+
+    kiro-cli can activate an on-disk spec by name. If list_agents enumerates a spec
+    (the file exists) but _read_agent_spec returns None -- a hardlink/symlink the
+    trusted-root gate refuses, a parse failure, an oversize file -- passing its
+    name through would let kiro-cli activate the UNPROJECTED spec with none of the
+    projection's hardening. So the preparation records a refusal under the spec's
+    name (and stem), and both the strict agent() and spawn_agent() refuse it.
+    """
+    _home, agents, project = native_tree
+    monkeypatch.setattr(
+        projection,
+        "list_agents",
+        lambda **kw: [SimpleNamespace(name="shady", filename="shady-file.json", scope="global")],
+    )
+    # The file exists (enumerated) but reads as None (unreadable/unparseable).
+    (agents / "shady-file.json").write_text("{ not valid json", encoding="utf-8")
+    monkeypatch.setattr(
+        projection,
+        "_read_agent_spec",
+        lambda *a, **k: None,
+    )
+    prepared = projection.prepare_native_skill_projection(project)
+    assert prepared.stems.get("shady-file") == "shady"
+    for name in ("shady", "shady-file"):
+        with pytest.raises(ValueError, match="could not be read"):
+            prepared.agent(name)
+        with pytest.raises(ValueError, match="could not be read"):
+            prepared.spawn_agent(name)
+
+
+def test_no_view_agent_spawns_under_its_own_name_despite_unrelated_on_disk_files(
+    native_tree, monkeypatch
+):
+    """A no-view agent spawns under its own name regardless of other files on disk.
+
+    Issue #15522's goal is that an agent with no prepared skill view spawns
+    normally under its own name instead of failing to start. The soft
+    ``spawn_agent`` resolver returns the authored name for any agent not among the
+    projected maps -- and the discovery layer is the authoritative backstop for
+    unreadable/hardlinked/non-regular specs (``_read_agent_spec`` folds those to
+    ``None`` so ``list_agents`` never yields them and no view is ever prepared from
+    them). A spec file present on disk that discovery dropped, a name-dedup
+    ``local-<package>-<name>.json`` twin discovery calls the expected on-disk
+    shape, an AppleDouble ``._x.json`` sidecar, a plain fenceless ``.md`` -- none
+    of these turn an unrelated no-view spawn into a hard failure.
+    """
+    _home, agents, project = native_tree
+    monkeypatch.setattr(projection, "list_agents", lambda **kw: [])
+    # Files discovery drops or dedups away, plus a plain non-spec doc. None of them
+    # is projected, and none must block an unrelated no-view spawn.
+    (agents / "foo.json").write_text(json.dumps({"name": "bar"}), encoding="utf-8")
+    (agents / "local-pkg-helper.json").write_text(json.dumps({"name": "helper"}), encoding="utf-8")
+    (agents / "._custom.json").write_text(json.dumps({"name": "custom"}), encoding="utf-8")
+    (agents / "vibe.md").write_text("# Vibe\n\nplain note, no fence.\n", encoding="utf-8")
+
+    prepared = projection.prepare_native_skill_projection(project)
+
+    # The restored base behaviour: an unprojected name keeps its authored name.
+    assert prepared.spawn_agent("never-seen") == "never-seen"
+    assert prepared.spawn_agent("bar") == "bar"
+    assert prepared.spawn_agent("vibe") == "vibe"
+    # The strict resolver still rejects an unprepared name (it guards set_mode).
+    with pytest.raises(ValueError, match="no prepared skill discovery view"):
+        prepared.agent("never-seen")
+
+
 def test_spawn_agent_keeps_the_authored_name_when_no_view_is_prepared():
     """A spawn of an agent the projection never prepared uses its own name.
 
@@ -283,6 +439,50 @@ def test_spawn_agent_still_raises_an_authored_restriction():
     )
     with pytest.raises(ValueError, match="explicitly excluded"):
         prepared.spawn_agent("custom")
+
+
+def test_stem_addressed_spec_is_mapped_not_passed_through():
+    """A spec addressed by its filename STEM resolves to the same alias as its name.
+
+    kiro-cli resolves an agent by its spec's filename stem as well as its authored
+    name, and the two can differ. ``stems`` records that second identity, so a
+    stem-addressed activation/spawn maps to the agent's alias instead of passing
+    the stem through untranslated (which would reach the cached spec unmapped).
+    """
+    prepared = projection.NativeSkillProjection(
+        {"custom": "native-alias"}, stems={"custom-file": "custom"}
+    )
+    assert prepared.agent("custom-file") == "native-alias"
+    assert prepared.spawn_agent("custom-file") == "native-alias"
+
+
+def test_stem_addressed_spec_honours_an_authored_refusal():
+    """A stem cannot bypass a refusal keyed on the agent's name.
+
+    A spec whose view was refused (an ``errors`` entry, keyed on the name) must
+    stay refused when addressed by its stem -- otherwise the stem would be a hole
+    around the very refusal the projection exists to enforce.
+    """
+    prepared = projection.NativeSkillProjection(
+        {},
+        errors={"custom": "skill_search is explicitly excluded; ..."},
+        stems={"custom-file": "custom"},
+    )
+    with pytest.raises(ValueError, match="explicitly excluded"):
+        prepared.agent("custom-file")
+    with pytest.raises(ValueError, match="explicitly excluded"):
+        prepared.spawn_agent("custom-file")
+
+
+def test_unknown_name_with_no_matching_spec_still_passes_through_on_spawn():
+    """The stem guard narrows nothing legitimate: a name that matches no alias,
+    error, or stem is still an unprojected agent and spawn keeps its own name."""
+    prepared = projection.NativeSkillProjection(
+        {"custom": "native-alias"}, stems={"custom-file": "custom"}
+    )
+    assert prepared.spawn_agent("unrelated") == "unrelated"
+    with pytest.raises(ValueError, match="no prepared"):
+        prepared.agent("unrelated")
 
 
 def test_unmapped_custom_agent_does_not_gain_tools_or_servers(native_tree):
@@ -3722,6 +3922,8 @@ async def test_set_mode_sends_the_fresh_alias_never_a_changed_spawn_one(
             runtime_module.AcpRuntime._adopted_skill_projection_generation
         )
         _adopt_skill_projection = runtime_module.AcpRuntime._adopt_skill_projection
+        _record_agents_in_projection = runtime_module.AcpRuntime._record_agents_in_projection
+        _resolve_start_alias = runtime_module.AcpRuntime._resolve_start_alias
         _superseding_alias = runtime_module.AcpRuntime._superseding_alias
         _refuse_if_view_superseded = runtime_module.AcpRuntime._refuse_if_view_superseded
         _refuse_if_view_unverified = runtime_module.AcpRuntime._refuse_if_view_unverified
@@ -3731,6 +3933,10 @@ async def test_set_mode_sends_the_fresh_alias_never_a_changed_spawn_one(
         _unadopted_skill_projection_generation = (
             runtime_module.AcpRuntime._unadopted_skill_projection_generation
         )
+        # The launched agent is some OTHER agent, not "crew": "crew" is a prepared
+        # agent (it has an alias), so activating it must take the strict alias path
+        # this test asserts, not the launched-agent allowance.
+        _agent = "launcher"
 
         async def terminate_session(self, sid):
             terminated.append(sid)
@@ -4266,6 +4472,30 @@ def test_a_rotated_credential_names_a_new_alias_but_a_launch_nonce_does_not(
     assert projection.prepare_native_skill_projection(project).agent("custom") == first
     source.write_text(json.dumps(_credential_spec("t2", "n2")), encoding="utf-8")
     assert projection.prepare_native_skill_projection(project).agent("custom") != first
+
+
+def test_recognise_carries_the_launch_name_exemption_across_a_refresh():
+    """The launch-name exemption is projection state, so recognise() -- the seam a
+    refresh uses to inherit an earlier projection's aliases -- must also carry
+    spawn_agent_name onto the fresh projection. Without this a refresh strands the
+    launched agent's own set_mode activation on the strict resolver."""
+    earlier = projection.NativeSkillProjection({}, spawn_agent_name="kirocrew")
+    fresh = projection.NativeSkillProjection({})
+    assert fresh.spawn_agent_name == ""
+    fresh.recognise(earlier)
+    assert fresh.spawn_agent_name == "kirocrew"
+
+
+def test_recognise_only_fills_an_empty_launch_name():
+    """recognise() fills spawn_agent_name only when the current projection has none:
+    a projection that already knows its launch name keeps it, and an earlier one
+    that never recorded a name does not blank it out."""
+    already = projection.NativeSkillProjection({}, spawn_agent_name="kirocrew")
+    already.recognise(projection.NativeSkillProjection({}, spawn_agent_name="other"))
+    assert already.spawn_agent_name == "kirocrew"
+
+    already.recognise(projection.NativeSkillProjection({}))  # earlier has no name
+    assert already.spawn_agent_name == "kirocrew"
 
 
 def test_recognise_admits_only_alias_names_and_registered_agent_names():
