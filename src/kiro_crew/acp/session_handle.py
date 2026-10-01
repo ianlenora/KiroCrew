@@ -903,7 +903,13 @@ class AcpRuntimeProtocol(Protocol):
         """
         ...
 
-    async def send_request(self, method: str, params: dict[str, Any]) -> int: ...
+    async def send_request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        on_reserved: Callable[[int], None] | None = None,
+    ) -> int: ...
 
     async def probe_advertised_models(
         self, *, force: bool = False, not_before: float = 0.0
@@ -3053,7 +3059,7 @@ class AcpSessionHandle:
             }
         else:
             payload = {"sessionId": self._session_id, "command": command}
-        req_id = await self._runtime.send_request(METHOD_COMMANDS_EXECUTE, payload)
+        req_id = await self._send_awaited(METHOD_COMMANDS_EXECUTE, payload)
         try:
             msg = await self._wait_for_response(req_id, timeout=60.0)
             result = msg.result or {}
@@ -3078,11 +3084,32 @@ class AcpSessionHandle:
 
         Sends session/set_config_option JSON-RPC request.
         """
-        req_id = await self._runtime.send_request(
+        req_id = await self._send_awaited(
             METHOD_SET_CONFIG_OPTION,
             {"sessionId": self._session_id, "configId": config_id, "value": value},
         )
         await self._wait_for_response(req_id, timeout=10.0)
+
+    async def _send_awaited(self, method: str, params: dict[str, Any]) -> int:
+        """Send a request whose response a following _wait_for_response claims.
+
+        The id joins _awaited_responses before the write: a response that lands
+        on the queue while the write drains would otherwise read as owed to
+        nobody and be dropped. _wait_for_response's finally removes it; a failed
+        send removes it here.
+        """
+        reserved: list[int] = []
+
+        def _reserve(req_id: int) -> None:
+            reserved.append(req_id)
+            self._awaited_responses.add(req_id)
+
+        try:
+            return await self._runtime.send_request(method, params, on_reserved=_reserve)
+        except BaseException:
+            for req_id in reserved:
+                self._awaited_responses.discard(req_id)
+            raise
 
     async def apply_session_permission_routing(self) -> None:
         """Make a ``SESSION_CONFIG`` harness actually ask, or refuse to run it.

@@ -4801,12 +4801,22 @@ class AcpRuntime:
 
     # ── Protocol Interface (used by AcpSessionHandle) ──
 
-    async def send_request(self, method: str, params: dict[str, Any]) -> int:
+    async def send_request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        on_reserved: "Callable[[int], None] | None" = None,
+    ) -> int:
         """Send a JSON-RPC request and return the request id.
 
         The response will be routed to the session's queue (via _routed_requests)
         so AcpSessionHandle can detect turn completion. For requests that need
         an immediate response (init, session/new), use _send_and_await instead.
+
+        ``on_reserved`` is called with the id BEFORE the write, whose ``drain()``
+        can suspend: the response can reach the session queue during that
+        suspension, so a caller that must claim it registers the id by then.
         """
         if not self._process or not self._process.stdin:
             raise AcpRuntimeDead("process not running")
@@ -4823,6 +4833,8 @@ class AcpRuntime:
         session_id = params.get("sessionId")
         if session_id and session_id in self._session_queues:
             self._routed_requests[req_id] = session_id
+        if on_reserved is not None:
+            on_reserved(req_id)
 
         req = JsonRpcRequest(method=method, params=params, id=req_id)
         data = json.dumps(req.to_dict()) + "\n"
