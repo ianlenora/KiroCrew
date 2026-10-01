@@ -18,7 +18,8 @@ from kiro_crew.acp.chat_runtime_sharing import (
     ChatRuntimeKey,
     agent_spec_generation,
     chat_runtime_cap,
-    eligible_for_chat_sharing,
+    chat_sharing_ineligible_reason,
+    member_launch_generation,
 )
 from kiro_crew.acp.client import (
     DEFAULT_MODEL,
@@ -459,6 +460,12 @@ class AcpProvider(LLMProvider):
         if agent:
             kwargs["agent"] = agent
         self.member_context = member_context
+        # WHICH member this session runs as, written by the allocator immediately
+        # before ``start()`` from the execution record it already reads there --
+        # like the account era below, and for the same reason: the chat-runtime key
+        # needs it, and no spawn parameter carries it because the harness does not.
+        # Empty for a session that is not a member's.
+        self.member_id: str = ""
         self.memory_mode = memory_mode
         # Kept on the provider, not only on the placeholder client: on the kiro
         # path ``_start_kiro_runtime_impl`` replaces that client with an
@@ -1216,25 +1223,38 @@ class AcpProvider(LLMProvider):
         chat_share_enabled = False
         chat_share_configured_cap = CHAT_RUNTIME_CAP
         chat_share_spec_generation = ""
+        chat_share_launch_generation = ""
         try:
             # Deferred: the config loader imports this provider module, so a
             # module-scope import here would close that cycle.
             from kiro_crew.config.loader import KiroCrewConfig
 
-            def _read_chat_share_inputs() -> tuple[object, str]:
-                """The two blocking reads the placement needs, in ONE off-loop hop.
+            def _read_chat_share_inputs() -> tuple[object, str, str]:
+                """The blocking reads the placement needs, in ONE off-loop hop.
 
                 A config cache miss stats, reads and validates; the spec
-                generation stats two directories. Either on the event loop would
-                stall every task on it, not just this start, and two hops cost
-                two context switches for values consumed together.
+                generation stats two directories; the launch generation reads this
+                member's documents, and only for a member session. Any of them on
+                the event loop would stall every task on it, not just this start,
+                and separate hops cost a context switch each for values consumed
+                together.
                 """
                 cfg = KiroCrewConfig.load().agent
-                return cfg, agent_spec_generation(work_dir, agent or "kirocrew")
+                return (
+                    cfg,
+                    agent_spec_generation(work_dir, agent or "kirocrew"),
+                    member_launch_generation(
+                        work_dir,
+                        agent or "kirocrew",
+                        member_context=self.member_context,
+                    ),
+                )
 
-            chat_agent_cfg, chat_share_spec_generation = await asyncio.to_thread(
-                _read_chat_share_inputs
-            )
+            (
+                chat_agent_cfg,
+                chat_share_spec_generation,
+                chat_share_launch_generation,
+            ) = await asyncio.to_thread(_read_chat_share_inputs)
             chat_share_enabled = bool(getattr(chat_agent_cfg, "chat_runtime_sharing", False))
             chat_share_configured_cap = int(
                 getattr(chat_agent_cfg, "chat_runtime_sharing_max_sessions", CHAT_RUNTIME_CAP)
@@ -1293,6 +1313,13 @@ class AcpProvider(LLMProvider):
         # provider's own, which every teardown path already calls.
         chat_share_lease: str | None = None
         chat_share_key: ChatRuntimeKey | None = None
+        # Whether the key above can still match another session's. It stops being
+        # true when placement gives up and swaps a unique token into the key to
+        # found this session its own process: nothing can join such a key and it
+        # can join nothing, so the frozen spawn inputs it carries are matched by
+        # no one and the SSH_AUTH_SOCK-forwarding consent is read fresh at spawn
+        # instead, exactly as it is for a session that never built a key.
+        chat_share_key_joinable = True
         # True only for a session that landed on a process ANOTHER session
         # founded. It decides the two things that differ for a joiner: whether
         # this provider may kill the process, and whether per-session start work
@@ -1316,6 +1343,13 @@ class AcpProvider(LLMProvider):
                 acp_backend=self._client.backend,
                 tool_search=self._tool_search_settings(),
                 member_context=self.member_context,
+                # WHICH member, and which generation of that member's launch
+                # documents. The documents are captured once, at spawn, and handed
+                # to every session the process serves, so two members must not land
+                # on one process and an edited source must not be swallowed by a
+                # join. Empty both for a non-member session, which captures none.
+                member_id=self.member_id,
+                launch_documents=chat_share_launch_generation,
                 memory_mode=self.memory_mode,
                 shared_scratch=self._shared_scratch,
                 mcp_gateway_overlay=mcp_gateway_overlay,
@@ -1349,14 +1383,27 @@ class AcpProvider(LLMProvider):
                 forward_ssh_auth_sock=chat_share_forward_ssh,
             )
 
-        if eligible_for_chat_sharing(
+        chat_share_refusal = chat_sharing_ineligible_reason(
             session_key=chat_share_session_key,
             memory_mode=self.memory_mode,
-            member_context=self.member_context,
             sharing_enabled=chat_share_enabled,
             backend=self._client.backend,
-        ):
+        )
+        if not chat_share_refusal:
             chat_share_key = _build_chat_share_key()
+        elif chat_share_enabled:
+            # One line per refused placement, at WARNING, because the operator who
+            # turned sharing ON is the one who needs it: the symptom of a refusal
+            # is a process count that did not fall, and the branch name is the only
+            # thing that distinguishes the four reasons. Logged ONLY while sharing
+            # is enabled -- with the switch off every start would refuse for the
+            # same reason and the line would be pure noise. The branch name and the
+            # session key, and nothing else: no path, no environment value.
+            logger.warning(
+                "chat-runtime-sharing ineligible reason=%s session=%s",
+                chat_share_refusal,
+                chat_share_session_key,
+            )
 
         async def _place_chat_runtime() -> Acquisition:
             """Take a lease, then CONFIRM the placement against the spec, account, and consent.
@@ -1394,7 +1441,7 @@ class AcpProvider(LLMProvider):
             """
             nonlocal chat_share_key, chat_share_spec_generation
             nonlocal chat_share_pre_spawn_era, chat_share_identity
-            nonlocal chat_share_forward_ssh
+            nonlocal chat_share_forward_ssh, chat_share_key_joinable
             assert chat_share_key is not None
             for _ in range(_CHAT_SHARE_PLACEMENT_ATTEMPTS):
                 placed = await RUNTIME_OWNERSHIP.acquire(
@@ -1515,6 +1562,12 @@ class AcpProvider(LLMProvider):
             # this session its own process, which is the same answer
             # ``agent_spec_generation`` gives when it cannot observe a file at all.
             chat_share_spec_generation = f"unsettled-{uuid.uuid4().hex}"
+            # The token above makes the key unique, so this last acquisition can
+            # only MISS and found a process of its own. Nothing matches the frozen
+            # forwarding consent it carries, so the spawn below reads the consent
+            # as it stands then -- an operator who revoked ssh-agent forwarding
+            # during these placements does not get a child holding it anyway.
+            chat_share_key_joinable = False
             chat_share_key = _build_chat_share_key()
             logger.warning(
                 "chat runtime sharing: the agent spec, account era, or forwarding consent "
@@ -1555,7 +1608,22 @@ class AcpProvider(LLMProvider):
                 # The consent frozen at placement and keyed on above, so the
                 # process forwards exactly what its key promised rather than
                 # re-reading a consent that may have toggled since.
-                forward_ssh_auth_sock=chat_share_forward_ssh,
+                #
+                # Passed ONLY on a key another session can match. Without such a
+                # key there is nothing for the frozen value to match, so handing it
+                # over would trade the fresh read inside spawn() for a staler one
+                # and buy nothing: an operator who revokes ssh-agent forwarding
+                # after this start's early read would still see the new process
+                # receive the agent socket, for the whole life of a process that
+                # cannot shed it. That covers a session with no key at all and one
+                # whose key was made unique after placement gave up.
+                # ``None`` means "resolve it at spawn", which is what every
+                # such caller wants.
+                forward_ssh_auth_sock=(
+                    chat_share_forward_ssh
+                    if chat_share_key is not None and chat_share_key_joinable
+                    else None
+                ),
             )
             try:
                 await fresh.spawn()
@@ -1624,6 +1692,20 @@ class AcpProvider(LLMProvider):
                 meta["chat_runtime_shared"] = True
                 meta["chat_runtime_joined"] = joined_shared_runtime
                 meta["chat_runtime_leases"] = acquisition.leases_on_runtime
+                # The other half of the placement record: one line saying where
+                # this session landed and how many sessions that process now
+                # serves. At WARNING for the same reason the refusal is -- an
+                # operator counting processes needs the two readings side by side,
+                # and INFO is below the level a running gateway keeps. The pid and
+                # the tenant count are the whole payload; the key itself is not
+                # logged, since it carries paths and environment values.
+                logger.warning(
+                    "chat-runtime-sharing %s runtime=%s tenants=%d session=%s",
+                    "joined" if joined_shared_runtime else "spawned",
+                    runtime.pid,
+                    acquisition.leases_on_runtime,
+                    chat_share_session_key,
+                )
             else:
                 runtime = await _spawn_chat_runtime()
         finally:

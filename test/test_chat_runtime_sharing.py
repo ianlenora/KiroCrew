@@ -19,7 +19,9 @@ import kiro_crew.runtime_ownership as ro
 from kiro_crew.acp.chat_runtime_sharing import (
     ChatRuntimeKey,
     chat_runtime_cap,
+    chat_sharing_ineligible_reason,
     eligible_for_chat_sharing,
+    member_launch_generation,
 )
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CODEX,
@@ -87,7 +89,6 @@ class TestChatSharingEligibility:
         assert eligible_for_chat_sharing(
             session_key="dashboard:chat-12-1790000000",
             memory_mode="persistent",
-            member_context=False,
             sharing_enabled=True,
             backend=ACP_BACKEND_KIRO,
         )
@@ -96,7 +97,6 @@ class TestChatSharingEligibility:
         assert eligible_for_chat_sharing(
             session_key="chat-12-1790000000",
             memory_mode="persistent",
-            member_context=False,
             sharing_enabled=True,
             backend=ACP_BACKEND_KIRO,
         )
@@ -106,25 +106,34 @@ class TestChatSharingEligibility:
         assert not eligible_for_chat_sharing(
             session_key="dashboard:chat-12-1790000000",
             memory_mode=mode,
-            member_context=False,
             sharing_enabled=True,
             backend=ACP_BACKEND_KIRO,
         )
 
-    def test_member_session_never_shares(self):
-        assert not eligible_for_chat_sharing(
+    def test_member_session_is_eligible_and_is_separated_by_the_key(self):
+        """A member session shares with its OWN member's sessions.
+
+        Eligibility admits one, and must: every dashboard slot of a crew member
+        carries ``member_id``, so refusing member sessions refuses the whole
+        dashboard and leaves each slot founding its own process. What two members
+        must not do -- land on one process -- is a comparison between two sessions,
+        so it belongs to the key, which separates them on ``member_id`` and on the
+        digest of the launch documents a member spawn captures.
+        """
+        assert eligible_for_chat_sharing(
             session_key="dashboard:chat-12-1790000000",
             memory_mode="persistent",
-            member_context=True,
             sharing_enabled=True,
             backend=ACP_BACKEND_KIRO,
+        )
+        assert a_key(member_context=True, member_id="kirocrew-lead") != a_key(
+            member_context=True, member_id="baymax"
         )
 
     def test_flag_off_disables_sharing(self):
         assert not eligible_for_chat_sharing(
             session_key="dashboard:chat-12-1790000000",
             memory_mode="persistent",
-            member_context=False,
             sharing_enabled=False,
             backend=ACP_BACKEND_KIRO,
         )
@@ -141,7 +150,6 @@ class TestChatSharingEligibility:
         assert not eligible_for_chat_sharing(
             session_key="dashboard:chat-12-1790000000",
             memory_mode="persistent",
-            member_context=False,
             sharing_enabled=True,
             backend=ACP_BACKEND_KAS,
         )
@@ -149,7 +157,6 @@ class TestChatSharingEligibility:
         assert eligible_for_chat_sharing(
             session_key="dashboard:chat-12-1790000000",
             memory_mode="persistent",
-            member_context=False,
             sharing_enabled=True,
             backend=ACP_BACKEND_KIRO,
         )
@@ -174,7 +181,6 @@ class TestChatSharingEligibility:
         assert not eligible_for_chat_sharing(
             session_key="dashboard:chat-12-1790000000",
             memory_mode="persistent",
-            member_context=False,
             sharing_enabled=True,
             backend=ACP_BACKEND_CODEX,
         )
@@ -195,10 +201,159 @@ class TestChatSharingEligibility:
         assert not eligible_for_chat_sharing(
             session_key=key,
             memory_mode="persistent",
-            member_context=False,
             sharing_enabled=True,
             backend=ACP_BACKEND_KIRO,
         )
+
+
+class TestTheRefusalNamesItsBranch:
+    """The reason is what an operator reads in the log, so it is pinned.
+
+    A refused placement looks exactly like a gateway where sharing was never
+    turned on: one process per session. The branch name is the only thing that
+    separates the four reasons, so a renamed or collapsed branch has to fail here.
+    """
+
+    def _ask(self, **overrides) -> str:
+        base = dict(
+            session_key="dashboard:chat-12-1790000000",
+            memory_mode="persistent",
+            sharing_enabled=True,
+            backend=ACP_BACKEND_KIRO,
+        )
+        base.update(overrides)
+        return chat_sharing_ineligible_reason(**base)
+
+    def test_an_eligible_session_has_no_reason(self):
+        assert self._ask() == ""
+
+    @pytest.mark.parametrize(
+        "overrides,reason",
+        [
+            ({"sharing_enabled": False}, "sharing_disabled"),
+            ({"backend": ACP_BACKEND_CODEX}, "backend_not_chat_shareable"),
+            ({"memory_mode": "incognito"}, "memory_mode_not_shareable"),
+            ({"session_key": "cron:nightly-digest"}, "origin_not_dashboard"),
+        ],
+    )
+    def test_each_refusal_names_its_own_branch(self, overrides, reason):
+        assert self._ask(**overrides) == reason
+
+    def test_a_member_session_is_not_a_refusal_branch_at_all(self):
+        """The member condition left this function: it is the key's job now, so no
+        input to this one can produce a member refusal."""
+        import inspect
+
+        params = inspect.signature(chat_sharing_ineligible_reason).parameters
+        assert "member_context" not in params
+        assert "member_context" not in inspect.signature(eligible_for_chat_sharing).parameters
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    @pytest.mark.parametrize("mode", ["persistent", "incognito"])
+    @pytest.mark.parametrize("backend", [ACP_BACKEND_KIRO, ACP_BACKEND_CODEX])
+    def test_the_boolean_and_the_reason_never_disagree(self, enabled, mode, backend):
+        """One decision, two spellings: a reason means refused, and no reason means
+        eligible. A branch added to one and not the other would split them."""
+        args = dict(
+            session_key="dashboard:chat-12-1790000000",
+            memory_mode=mode,
+            sharing_enabled=enabled,
+            backend=backend,
+        )
+        assert eligible_for_chat_sharing(**args) == (chat_sharing_ineligible_reason(**args) == "")
+
+
+class TestTheLaunchDocumentGeneration:
+    """What a member spawn would capture, as a token the key can compare."""
+
+    def test_a_non_member_spawn_captures_nothing_and_says_so(self):
+        """``""`` is a real answer, not a failure: two non-member starts agree on
+        it, which is the placement they had before this field existed."""
+        assert member_launch_generation("/home/u/ws", "kirocrew", member_context=False) == ""
+
+    def test_the_same_documents_give_the_same_token(self, monkeypatch):
+        monkeypatch.setattr(
+            "kiro_crew.member_essential_context.kiro_launch_documents",
+            lambda agent, project: [("a.md", "one"), ("b.md", "two")],
+        )
+        one = member_launch_generation("/home/u/ws", "kirocrew-lead", member_context=True)
+        two = member_launch_generation("/home/u/ws", "kirocrew-lead", member_context=True)
+        assert one == two
+        assert one != ""
+
+    def test_an_edited_body_moves_the_token(self, monkeypatch):
+        monkeypatch.setattr(
+            "kiro_crew.member_essential_context.kiro_launch_documents",
+            lambda agent, project: [("a.md", "one")],
+        )
+        before = member_launch_generation("/home/u/ws", "kirocrew-lead", member_context=True)
+        monkeypatch.setattr(
+            "kiro_crew.member_essential_context.kiro_launch_documents",
+            lambda agent, project: [("a.md", "one edited")],
+        )
+        assert (
+            member_launch_generation("/home/u/ws", "kirocrew-lead", member_context=True) != before
+        )
+
+    def test_a_renamed_source_moves_the_token(self, monkeypatch):
+        """Both halves of every entry are hashed: the source names reach the child
+        as the labels on its documents, so a rename is a different capture."""
+        monkeypatch.setattr(
+            "kiro_crew.member_essential_context.kiro_launch_documents",
+            lambda agent, project: [("a.md", "one")],
+        )
+        before = member_launch_generation("/home/u/ws", "kirocrew-lead", member_context=True)
+        monkeypatch.setattr(
+            "kiro_crew.member_essential_context.kiro_launch_documents",
+            lambda agent, project: [("renamed.md", "one")],
+        )
+        assert (
+            member_launch_generation("/home/u/ws", "kirocrew-lead", member_context=True) != before
+        )
+
+    def test_a_body_moved_between_two_sources_moves_the_token(self, monkeypatch):
+        """Length-prefixed framing: concatenating the parts differently must not
+        produce the same digest."""
+        monkeypatch.setattr(
+            "kiro_crew.member_essential_context.kiro_launch_documents",
+            lambda agent, project: [("a.md", "onetwo"), ("b.md", "")],
+        )
+        before = member_launch_generation("/home/u/ws", "kirocrew-lead", member_context=True)
+        monkeypatch.setattr(
+            "kiro_crew.member_essential_context.kiro_launch_documents",
+            lambda agent, project: [("a.md", "one"), ("b.md", "two")],
+        )
+        assert (
+            member_launch_generation("/home/u/ws", "kirocrew-lead", member_context=True) != before
+        )
+
+    def test_document_order_does_not_fragment_the_table(self, monkeypatch):
+        """The delivered form is a dict, so the same set of sources is the same
+        process configuration whichever order they were walked in."""
+        monkeypatch.setattr(
+            "kiro_crew.member_essential_context.kiro_launch_documents",
+            lambda agent, project: [("a.md", "one"), ("b.md", "two")],
+        )
+        one = member_launch_generation("/home/u/ws", "kirocrew-lead", member_context=True)
+        monkeypatch.setattr(
+            "kiro_crew.member_essential_context.kiro_launch_documents",
+            lambda agent, project: [("b.md", "two"), ("a.md", "one")],
+        )
+        assert member_launch_generation("/home/u/ws", "kirocrew-lead", member_context=True) == one
+
+    def test_an_unobservable_capture_founds_its_own_process(self, monkeypatch):
+        """Absence of evidence must not admit a join: a start that cannot read the
+        documents gets a token matching no other key, so it spawns."""
+
+        def boom(agent, project):
+            raise OSError("steering unreadable")
+
+        monkeypatch.setattr("kiro_crew.member_essential_context.kiro_launch_documents", boom)
+        one = member_launch_generation("/home/u/ws", "kirocrew-lead", member_context=True)
+        two = member_launch_generation("/home/u/ws", "kirocrew-lead", member_context=True)
+        assert one.startswith("unobservable-")
+        assert one != two
+        assert a_key(launch_documents=one) != a_key(launch_documents=two)
 
 
 # ── The cap ──
@@ -296,6 +451,115 @@ class TestChatRuntimeKey:
         from kiro_crew.acp.chat_runtime_sharing import _freeze_path
 
         assert _freeze_path("/home/u/a") != _freeze_path("/home/u/b")
+
+    def test_one_member_sessions_shaped_like_live_share_one_key(self):
+        """The live shape, end to end: four dashboard slots of ONE member, same
+        agent, same work directory, land on ONE process.
+
+        This is the case that was costing a process per slot. Driven through the
+        registry rather than compared as keys alone, because the bug had two halves
+        -- eligibility refused the session, and the key could not tell two members
+        apart -- and only a placement exercises both.
+        """
+        ro._reset_for_tests()
+        try:
+            live = dict(
+                work_dir="/home/u/.kirocrew/workspace",
+                agent="kirocrew-lead",
+                member_context=True,
+                member_id="kirocrew-lead",
+                launch_documents="3-deadbeef",
+            )
+            table = ro.RUNTIME_OWNERSHIP
+            rt = FakeRuntime(pid=9400)
+            spawn = spawner(rt)
+            placements = []
+            for n in range(4):
+                session = f"dashboard:chat-{n}-1790000000"
+                assert eligible_for_chat_sharing(
+                    session_key=session,
+                    memory_mode="persistent",
+                    sharing_enabled=True,
+                    backend=ACP_BACKEND_KIRO,
+                ), "a member's dashboard slot must be allowed to share"
+                placements.append(
+                    asyncio.run(table.acquire(a_key(**live), session, spawn, cap=1000000))
+                )
+            assert len(spawn.calls) == 1, "four slots of one member founded more than one process"
+            assert [p.joined for p in placements] == [False, True, True, True]
+            assert placements[-1].leases_on_runtime == 4
+            assert all(p.runtime is rt for p in placements)
+        finally:
+            ro._reset_for_tests()
+
+    def test_a_second_member_gets_its_own_process(self):
+        """The other direction of the same placement: a different member does not
+        join, even with every other spawn input identical."""
+        ro._reset_for_tests()
+        try:
+            same = dict(
+                work_dir="/home/u/.kirocrew/workspace",
+                agent="kirocrew-lead",
+                member_context=True,
+                launch_documents="3-deadbeef",
+            )
+            table = ro.RUNTIME_OWNERSHIP
+            lead_rt = FakeRuntime(pid=9410)
+            other_rt = FakeRuntime(pid=9411)
+            spawn = spawner(lead_rt, other_rt)
+            lead = asyncio.run(
+                table.acquire(
+                    a_key(member_id="kirocrew-lead", **same),
+                    "dashboard:chat-1-1790000000",
+                    spawn,
+                    cap=1000000,
+                )
+            )
+            other = asyncio.run(
+                table.acquire(
+                    a_key(member_id="baymax", **same),
+                    "dashboard:chat-2-1790000000",
+                    spawn,
+                    cap=1000000,
+                )
+            )
+            assert len(spawn.calls) == 2, "two members landed on one process"
+            assert other.joined is False
+            assert lead.runtime is lead_rt and other.runtime is other_rt
+        finally:
+            ro._reset_for_tests()
+
+    def test_two_members_never_share_however_alike_the_rest_is(self):
+        """``member_id`` splits the key on its own.
+
+        Checked with the launch digest held EQUAL, which is the case the digest
+        cannot cover: two members whose documents are byte-identical today would
+        otherwise share, and the first edit to either member's sources would leave
+        one of them running the other's captured snapshot.
+        """
+        same = dict(member_context=True, launch_documents="3-deadbeef")
+        assert a_key(member_id="kirocrew-lead", **same) != a_key(member_id="baymax", **same)
+        assert a_key(member_id="kirocrew-lead", **same) == a_key(member_id="kirocrew-lead", **same)
+
+    def test_a_member_session_never_shares_with_a_non_member_one(self):
+        """A member process captures launch documents; a non-member one captures
+        none, and nothing in a running process can shed or acquire them."""
+        assert a_key(member_context=True, member_id="kirocrew-lead") != a_key(
+            member_context=False, member_id=""
+        )
+        assert a_key(member_context=True) != a_key(member_context=False)
+
+    def test_an_edited_launch_document_splits_the_key(self):
+        """The generation is keyed so an edit reaches the next session.
+
+        Without it a session starting after a steering edit joins a process serving
+        the pre-edit text, where before sharing it would have spawned and read the
+        new one.
+        """
+        assert a_key(member_context=True, launch_documents="3-aaaa") != a_key(
+            member_context=True, launch_documents="3-bbbb"
+        )
+        assert a_key(launch_documents=None) == a_key()
 
     def test_reasoning_effort_splits_the_key(self):
         """Two slots asking for different effort cannot share one process.
@@ -725,6 +989,41 @@ class TestThePlacementIsConfirmedAgainstTheSpecAfterwards:
         finally:
             ro._reset_for_tests()
 
+    def test_every_placement_decision_is_logged_at_warning(self):
+        """Structural: one WARNING line per placement, in the two places a
+        placement is decided.
+
+        A refusal and a join are both invisible at WARNING without these, which is
+        how a gateway ran 24 processes for 14 sessions with nothing in the log
+        saying why. Pinned by source because reaching either line needs the whole
+        ``AcpProvider.start`` preamble, and what a later edit silently does is drop
+        the level to INFO or delete the call.
+        """
+        import re
+        from pathlib import Path
+
+        import kiro_crew.providers.acp as provider_mod
+
+        source = Path(provider_mod.__file__).read_text()
+        # Control: the string the scan is built around is really in this file, so
+        # an empty match below means the call went away rather than the scan being
+        # pointed at the wrong module.
+        assert "chat-runtime-sharing" in source, "scanning the wrong module proves nothing"
+        refusal = re.search(
+            r"logger\.warning\(\s*\n\s*\"chat-runtime-sharing ineligible reason=%s session=%s\"",
+            source,
+        )
+        assert refusal, "the ineligible branch is no longer logged at WARNING"
+        placement = re.search(
+            r"logger\.warning\(\s*\n\s*\"chat-runtime-sharing %s runtime=%s tenants=%d session=%s\"",
+            source,
+        )
+        assert placement, "the join/spawn outcome is no longer logged at WARNING"
+        outcome = source[placement.end() : placement.end() + 200]
+        assert (
+            '"joined" if joined_shared_runtime else "spawned"' in outcome
+        ), "the outcome word no longer comes from the acquisition's own joined flag"
+
     def test_the_confirmation_is_wired_into_the_placement(self):
         """Structural: the helper being right is not the placement calling it.
 
@@ -817,6 +1116,148 @@ class TestThePlacementIsConfirmedAgainstTheSpecAfterwards:
                     "a confirmation in the placement is gated on a literal false, so the "
                     f"read it guards decides nothing (line {node.lineno} of providers/acp.py)"
                 )
+
+
+class TestAnUnkeyedSpawnRereadsTheForwardingConsent:
+    """The frozen consent travels with a KEY, and only with a key.
+
+    Freezing the SSH_AUTH_SOCK-forwarding consent is what lets a shared process
+    match the key it was founded under. The unshared branch founds no key, so
+    handing it the frozen value there swaps the fresh read inside ``spawn()``
+    for an older one and protects nothing: an operator who revokes forwarding
+    after this start's early read would still see the new process receive the
+    agent socket, and a running process cannot shed it.
+    """
+
+    def test_the_spawn_site_conditions_the_override_on_the_key(self):
+        """The argument is a conditional on ``chat_share_key``, not the bare value.
+
+        Read as a tree rather than as text: the unconditional spelling and the
+        conditional one share every identifier, so a substring search passes on
+        both and would pin nothing.
+        """
+        import ast
+        from pathlib import Path
+
+        import kiro_crew.providers.acp as provider_mod
+
+        source = Path(provider_mod.__file__).read_text(encoding="utf-8")
+        spawn = next(
+            n
+            for n in ast.walk(ast.parse(source))
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name == "_spawn_chat_runtime"
+        )
+        overrides = [
+            kw
+            for node in ast.walk(spawn)
+            if isinstance(node, ast.Call)
+            for kw in node.keywords
+            if kw.arg == "forward_ssh_auth_sock"
+        ]
+        assert len(overrides) == 1, (
+            "expected exactly one forwarding-consent argument in the spawn helper, "
+            f"found {len(overrides)}"
+        )
+        value = overrides[0].value
+        assert isinstance(value, ast.IfExp), (
+            "the spawn helper hands the frozen forwarding consent to EVERY start. "
+            "Without a key there is nothing for it to match, so an unshared spawn "
+            "uses a staler consent than the fresh read it displaces"
+        )
+        guard = {n.id for n in ast.walk(value.test) if isinstance(n, ast.Name)}
+        assert "chat_share_key" in guard, (
+            "the override is conditional, but not on whether this start keyed a "
+            f"shared runtime (guard reads {sorted(guard)})"
+        )
+        assert "chat_share_key_joinable" in guard, (
+            "the guard asks whether a key exists but not whether anything can match "
+            "it. Placement swaps a unique token into the key when it gives up, and "
+            "that last spawn then founds its own process under a consent nobody "
+            f"keyed on (guard reads {sorted(guard)})"
+        )
+        assert isinstance(
+            value.orelse, ast.Constant
+        ), "the unkeyed branch must pass a literal None so spawn() resolves consent"
+        assert value.orelse.value is None, (
+            "the unkeyed branch passes "
+            f"{value.orelse.value!r} rather than None, so spawn() still skips its own read"
+        )
+
+    def test_giving_up_on_placement_drops_the_frozen_consent(self):
+        """Exhaustion must clear joinability BEFORE its own founding acquire.
+
+        The retry tail swaps a unique token into the key so this session takes a
+        process of its own. That acquisition can only miss, so no other session
+        keyed on the consent frozen with it -- and three mismatching placements
+        are exactly the window in which an operator revoked forwarding. Reading
+        it fresh at spawn is the only answer that honours the revocation.
+        """
+        import ast
+        from pathlib import Path
+
+        import kiro_crew.providers.acp as provider_mod
+
+        source = Path(provider_mod.__file__).read_text(encoding="utf-8")
+        place = next(
+            n
+            for n in ast.walk(ast.parse(source))
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name == "_place_chat_runtime"
+        )
+        loops = [n for n in place.body if isinstance(n, ast.For)]
+        assert len(loops) == 1, f"expected one placement loop, found {len(loops)}"
+        tail = [n for n in place.body if n is not loops[0]]
+        cleared = [
+            stmt
+            for node in tail
+            for stmt in ast.walk(node)
+            if isinstance(stmt, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "chat_share_key_joinable" for t in stmt.targets
+            )
+        ]
+        assert len(cleared) == 1, (
+            "the exhausted tail does not record that its key became unjoinable, so "
+            "the fallback spawn still hands a process the consent frozen three "
+            f"placements ago (found {len(cleared)} assignments)"
+        )
+        assigned = cleared[0].value
+        assert isinstance(assigned, ast.Constant) and assigned.value is False, (
+            "the tail assigns "
+            f"{ast.dump(assigned)} rather than False, so the key still reads as joinable"
+        )
+        in_loop = [
+            stmt
+            for stmt in ast.walk(loops[0])
+            if isinstance(stmt, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "chat_share_key_joinable" for t in stmt.targets
+            )
+        ]
+        assert not in_loop, (
+            "a retry that is still placing against other sessions cleared joinability, "
+            "which would drop the freeze the key is still being matched on"
+        )
+
+    def test_the_runtime_treats_none_as_resolve_it_yourself(self):
+        """``None`` is the contract the unkeyed branch relies on.
+
+        The provider's fix is only a fix because the runtime reads a ``None``
+        override as "no frozen answer, resolve the consent at spawn". If that
+        consumer ever treated ``None`` as a value, the unkeyed branch would be
+        passing an answer of "off" rather than asking for a fresh read.
+        """
+        from pathlib import Path
+
+        import kiro_crew.acp.runtime as runtime_mod
+
+        source = Path(runtime_mod.__file__).read_text(encoding="utf-8")
+        assert "if self._forward_ssh_auth_sock_override is not None:" in source, (
+            "the runtime no longer distinguishes an absent override from a false one, "
+            "so an unkeyed spawn's None is read as a decision instead of a request "
+            "to resolve the consent"
+        )
 
 
 # ── Two sessions on one process ──

@@ -10,9 +10,11 @@ runtime in the gateway, consulted by the kill gate. This module supplies the two
 things that registry deliberately does not decide, plus the cap:
 
 ``eligible_for_chat_sharing``
-    Whether a session may share at all. A cron, hook, task-runner or crew-member
-    session keeps its own process, and so does an incognito or temporary session
-    -- see the function's own reasoning.
+    Whether a session may share at all. A cron, hook or task-runner session keeps
+    its own process, and so does an incognito or temporary session -- see the
+    function's own reasoning. A crew-member session MAY share, with the sessions
+    of that same member; what keeps two different members apart is the key, not
+    this gate.
 
 :class:`ChatRuntimeKey`
     WHICH process, as the registry's compatibility key. Two sessions may land on
@@ -77,11 +79,40 @@ def chat_runtime_cap(*, sharing_enabled: bool, configured: int) -> int:
     return max(CHAT_RUNTIME_CAP, int(configured))
 
 
+def chat_sharing_ineligible_reason(
+    *,
+    session_key: str | None,
+    memory_mode: str,
+    sharing_enabled: bool,
+    backend: str,
+) -> str:
+    """WHY this session may not share a chat runtime, or ``""`` when it may.
+
+    The decision itself lives here, and :func:`eligible_for_chat_sharing` is the
+    boolean over it, so there is exactly one place the branches are written. The
+    reason is returned rather than only logged because a refusal is invisible
+    otherwise: an operator who turned sharing on and still sees one process per
+    session has no way to tell WHICH condition refused, and the branch name is
+    the whole answer.
+
+    Each value names the condition, never a session property worth hiding: a
+    branch name carries no key, no path and no environment value.
+    """
+    if not sharing_enabled:
+        return "sharing_disabled"
+    if backend not in ACP_BACKENDS_CHAT_RUNTIME_SHARING:
+        return "backend_not_chat_shareable"
+    if memory_mode not in _SHAREABLE_MEMORY_MODES:
+        return "memory_mode_not_shareable"
+    if telemetry_channel_of(session_key) != "dashboard":
+        return "origin_not_dashboard"
+    return ""
+
+
 def eligible_for_chat_sharing(
     *,
     session_key: str | None,
     memory_mode: str,
-    member_context: bool,
     sharing_enabled: bool,
     backend: str,
 ) -> bool:
@@ -112,19 +143,21 @@ def eligible_for_chat_sharing(
     unsupported backend have equal keys, so they would share with each other,
     which is the broken case rather than a safe one.
 
-    ``member_context`` is refused because a crew member's process captures that
-    member's native launch documents at spawn, so its process is already
-    member-specific.
+    A crew-member session is NOT refused here, and that is the one condition this
+    function deliberately leaves to the key. Its process is member-specific in
+    exactly one respect -- the native launch documents captured at spawn -- and
+    that is a property two sessions can be compared ON, so the key compares them:
+    ``member_id`` and ``launch_documents`` (see :class:`ChatRuntimeKey`). Refusing
+    instead was correct only while nothing in the key could tell two members
+    apart; it also refused every session of ONE member from sharing with itself,
+    which is the common case on a dashboard where every slot carries a member.
     """
-    if not sharing_enabled:
-        return False
-    if backend not in ACP_BACKENDS_CHAT_RUNTIME_SHARING:
-        return False
-    if member_context:
-        return False
-    if memory_mode not in _SHAREABLE_MEMORY_MODES:
-        return False
-    return telemetry_channel_of(session_key) == "dashboard"
+    return not chat_sharing_ineligible_reason(
+        session_key=session_key,
+        memory_mode=memory_mode,
+        sharing_enabled=sharing_enabled,
+        backend=backend,
+    )
 
 
 def _freeze_env(extra_env: dict[str, str] | None) -> tuple[tuple[str, str], ...]:
@@ -208,13 +241,52 @@ class ChatRuntimeKey:
     ``member_context``
         Decides whether native launch documents are captured at spawn.
 
-        An eligibility MIRROR, not a discriminator: ``eligible_for_chat_sharing``
-        refuses a member session outright, so the only value that ever reaches
-        this key is ``False``. That single admitted value is the reason the field
-        stays -- it is the second line of a two-line defence over a property that
-        is unsafe to share, and eligibility cannot be folded into the key (see
-        that function's own note on equal keys). Removing it as a constant
-        removes a guard.
+        A real discriminator rather than a mirror: eligibility admits a member
+        session, so both values reach this key. A member process holds the
+        documents ``kiro_launch_documents`` returned at ITS spawn and hands them to
+        every session it serves, while a non-member process holds none -- so the
+        two cannot be one process whatever else matches.
+    ``member_id``
+        WHICH crew member this session runs as.
+
+        Keyed even though no spawn parameter carries it, because the thing it
+        selects -- the member's launch documents -- is captured once, at spawn, and
+        handed to every session on the process. Two members must therefore never
+        land on one process, and this is the field that says so directly rather
+        than relying on the document hash below happening to differ: two members
+        whose documents are byte-identical today would otherwise share, and the
+        first edit to either member's sources would leave one of them running the
+        other's captured set.
+
+        It also stands in for the member's MEMORY STORE, which is a function of
+        this id in config. The store itself is read per session from the execution
+        record, not at spawn, so it is not a process-level input and gets no field
+        of its own.
+    ``launch_documents``
+        The CONTENT of the native launch documents this spawn would capture.
+
+        ``member_id`` says which member; this says which GENERATION of that
+        member's sources, and the two answer different questions. The documents are
+        read from the filesystem at spawn (project steering, the member's declared
+        template sources, always-steering under the home directory) and the process
+        holds that snapshot for its whole life. Without this field a session
+        starting after one of those files is edited joins a process serving the
+        pre-edit text, where before sharing it would have spawned and read the new
+        one -- so the field is what keeps an edit reaching the next session instead
+        of being swallowed by a join.
+
+        Hashed rather than stat'd for the reason ``spec_generation`` is: a stat
+        triple can be restored, a digest cannot. ``""`` for a non-member session,
+        which captures no documents at all.
+
+        NOT re-confirmed after the acquisition, unlike ``spec_generation``,
+        ``spawn_identity`` and ``forward_ssh_auth_sock``. Those three are
+        revocations -- a withdrawn grant, a changed account, a withdrawn consent --
+        where landing on a process founded under the older value defeats the
+        withdrawal. An edited steering document is guidance, not a grant, and the
+        founder itself reads its documents after its own key is built, so a
+        re-confirm would promise a freshness the founding path does not have
+        either.
     ``memory_mode``
         Latches the runtime's recording permission at ``create_session``.
 
@@ -286,6 +358,8 @@ class ChatRuntimeKey:
     acp_backend: str
     tool_search: tuple[object, ...]
     member_context: bool
+    member_id: str
+    launch_documents: str
     memory_mode: str
     shared_scratch: str
     mcp_gateway_overlay: str
@@ -314,6 +388,8 @@ class ChatRuntimeKey:
         reasoning_effort: str | None = None,
         spawn_identity: str | None = None,
         spec_generation: str | None = None,
+        member_id: str | None = None,
+        launch_documents: str | None = None,
         forward_ssh_auth_sock: bool = False,
     ) -> "ChatRuntimeKey":
         """Build the key from the values a caller is about to spawn with.
@@ -337,6 +413,8 @@ class ChatRuntimeKey:
             acp_backend=acp_backend or "",
             tool_search=_freeze_tool_search(tool_search),
             member_context=bool(member_context),
+            member_id=member_id or "",
+            launch_documents=launch_documents or "",
             memory_mode=memory_mode or "",
             shared_scratch=_freeze_path(shared_scratch),
             mcp_gateway_overlay=_freeze_path(mcp_gateway_overlay),
@@ -501,9 +579,57 @@ def agent_spec_generation(work_dir: str | Path | None, agent: str) -> str:
     return "|".join(parts)
 
 
+def member_launch_generation(
+    work_dir: str | Path | None,
+    agent: str,
+    *,
+    member_context: bool,
+) -> str:
+    """A token that CHANGES whenever a member spawn's launch documents change.
+
+    ``KiroHarness.resolve_spawn`` captures ``kiro_launch_documents(agent,
+    work_dir)`` when the session is a member one, and the process hands that
+    snapshot to every session it goes on to serve. So the documents are a
+    process-level input exactly like the ``--agent`` spec, and they are observed
+    the same way: read, hashed, and compared as a key field.
+
+    Hashed over BOTH halves of every entry, each length-prefixed, so neither a
+    renamed source nor a body moved between two sources can produce the digest of
+    a different document set.
+
+    ``""`` for a non-member session, which is a real answer rather than a failure:
+    such a spawn captures no documents, and two non-member starts agree on that.
+    Any failure to observe contributes a unique token instead, so a start that
+    cannot prove the generation founds its own process rather than joining on an
+    unproven match -- the same rule :func:`agent_spec_generation` follows.
+
+    Blocking I/O: call it off the event loop.
+    """
+    if not member_context:
+        return ""
+    try:
+        from kiro_crew.member_essential_context import kiro_launch_documents
+
+        documents = kiro_launch_documents(agent, str(work_dir) if work_dir else None)
+    except Exception:
+        return f"unobservable-{uuid.uuid4().hex}"
+    digest = hashlib.sha256()
+    # Sorted, because the delivered form is a DICT: the same set of sources is the
+    # same process configuration whichever order the reader happened to walk them
+    # in, and an order-sensitive digest would fragment the table on nothing.
+    for source, body in sorted((str(s), str(b)) for s, b in documents):
+        for part in (source, body):
+            digest.update(str(len(part)).encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(part.encode("utf-8", "surrogatepass"))
+    return f"{len(documents)}-{digest.hexdigest()}"
+
+
 __all__ = [
     "ChatRuntimeKey",
     "agent_spec_generation",
     "chat_runtime_cap",
+    "chat_sharing_ineligible_reason",
     "eligible_for_chat_sharing",
+    "member_launch_generation",
 ]

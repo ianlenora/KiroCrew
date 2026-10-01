@@ -691,19 +691,27 @@ class SessionCleanup:
             return
 
         candidates: list[tuple[str, int, SessionEntry]] = []
+        tenants_by_pid: dict[int, int] = {}
         persistent_keys = self._deps.get_persistent_keys()
         channel_prefix = self._deps.get_channel_prefix()
         async with self._owner._lock:
             for key, session in self._owner._sessions.items():
+                pid = self._owner.get_pid(key)
+                if pid is None:
+                    continue
+                # Every session on the process is counted, including the ones
+                # this sweep may not recycle. A persistent, channel-owned or
+                # mid-turn co-tenant still holds its share of the tree the
+                # threshold is read against, so leaving it out of the divisor
+                # would charge the eligible sessions for memory it is using.
+                tenants_by_pid[pid] = tenants_by_pid.get(pid, 0) + 1
                 if key in persistent_keys or key.startswith(channel_prefix):
                     continue
                 if session.semaphore.locked():
                     continue
-                pid = self._owner.get_pid(key)
-                if pid is not None:
-                    candidates.append((key, pid, session))
+                candidates.append((key, pid, session))
 
-        victims: list[tuple[str, int, int, SessionEntry]] = []
+        victims: list[tuple[str, int, int, int, SessionEntry]] = []
         if candidates:
             loop = asyncio.get_running_loop()
             measure: Callable[[int], int]
@@ -737,8 +745,9 @@ class SessionCleanup:
                         pid,
                     )
                     rss_by_pid[pid] = rss
-                if rss > self.state.rss_max_mb:
-                    victims.append((key, pid, rss, session))
+                limit = self._rss_limit_for(pid, tenants_by_pid)
+                if rss > limit:
+                    victims.append((key, pid, rss, limit, session))
 
         # One RECLAIM per runtime per tick. The threshold was crossed by a
         # process, and every session on it reads the same figure, so recycling
@@ -748,7 +757,7 @@ class SessionCleanup:
         # reset that actually happened, not on an attempt: a victim the guards
         # below decline has reclaimed nothing, so a co-tenant is still eligible.
         recycled_pids: set[int] = set()
-        for key, pid, rss, session in victims:
+        for key, pid, rss, limit, session in victims:
             if pid in recycled_pids:
                 self._deps.logger.debug(
                     "RSS recycle: runtime %d already recycled a session this tick; "
@@ -769,7 +778,7 @@ class SessionCleanup:
                         "but has attached sub-agent work; skipping",
                         key,
                         rss,
-                        self.state.rss_max_mb,
+                        limit,
                     )
                     continue
                 # Ask the injection counter AGAIN, here. The wrapper above asks
@@ -806,7 +815,7 @@ class SessionCleanup:
                     "RSS recycle: session %s tree rss=%dMB exceeds %dMB",
                     key,
                     rss,
-                    self.state.rss_max_mb,
+                    limit,
                 )
                 self._deps.stats_factory().inc_session_cleaned()
                 await self._owner._fire_recycle_callback(
@@ -816,6 +825,23 @@ class SessionCleanup:
             except Exception:
                 # One victim cannot suppress the rest of this tick.
                 self._deps.logger.exception("RSS recycle failed for session %s", key)
+
+    def _rss_limit_for(self, pid: int, tenants_by_pid: dict[int, int]) -> int:
+        """Return the RSS ceiling for *pid*, scaled by how many sessions it hosts.
+
+        ``session.watchdog_rss_max_mb`` is a budget for ONE session's runtime.
+        A shared runtime hosts several, and the figure measured against it is the
+        whole process tree, so an unscaled comparison charges one session's
+        budget for N sessions' memory and crosses on the first sweep after
+        sharing begins -- recycling a healthy session every tick. The ceiling is
+        therefore per tenant: a runtime with N tenants may hold N budgets.
+
+        A pid missing from the map is treated as a single tenant, which is the
+        unshared behaviour: the map is built from the same snapshot the
+        candidates are, so an absent pid means the session was counted under a
+        different pid and the conservative reading is the smallest ceiling.
+        """
+        return self.state.rss_max_mb * max(1, tenants_by_pid.get(pid, 1))
 
     def _injection_pending(self, key: str) -> bool:
         """Fail-closed read of "is a completion injection in flight for *key*?".

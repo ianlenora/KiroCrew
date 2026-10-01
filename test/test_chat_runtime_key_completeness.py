@@ -97,6 +97,20 @@ _OBSERVED_KEYED = {
         "layer writes; a grant revoked in it cannot be undone inside a running "
         "process, so two generations must be two keys."
     ),
+    "member_id": (
+        "Which crew member this session runs as, read from the execution record by "
+        "the allocator and written onto the provider before start(). The runtime "
+        "takes no such parameter because the harness needs only the member_context "
+        "bool, but the launch documents that bool captures are THIS member's, so "
+        "two members sharing one process would run on one member's captured set."
+    ),
+    "launch_documents": (
+        "A digest of the native launch documents a member spawn would capture, read "
+        "from the filesystem at placement time. The process holds that snapshot for "
+        "its whole life and hands it to every session on it, so an edited source "
+        "must split the key or the next session silently joins a process serving "
+        "the pre-edit text. Empty for a non-member spawn, which captures none."
+    ),
 }
 
 #: Every function that takes the workspace ``cli.json`` lock -> what accounts for
