@@ -8899,12 +8899,47 @@ class GatewayOrchestrator:
             text, _ = redact_credentials(text)
             await asyncio.to_thread(append_and_surface, state, slot, "notice", text, "msg msg-info")
 
+        def _worker_slot_running(session_key: str) -> bool:
+            """Bind the wake gate's liveness question to this gateway's slot table.
+
+            The logic is ``ledger_wake.worker_running``, not a copy of it here: a
+            closure inside this constructor is unreachable from a test, and the one
+            hop the probe cannot make for itself is exactly the hop that should not
+            be the untested one. This keeps only the binding, which is what a
+            gateway is for.
+
+            Imported HERE rather than at module scope, matching
+            ``_monitor_owner_session_id`` below. ``ledger_wake`` reaches the
+            work-ledger store, and every gateway boots whether or not any conductor
+            has ever opened a ledger, so a module-level import would put an optional
+            subsystem on the startup path of every install to serve a callable that
+            only runs once a work-ledger watch ticks.
+            """
+            from kiro_crew import ledger_wake
+
+            return ledger_wake.worker_running(self.dashboard_state, session_key)
+
+        def _worker_slot_closed(session_key: str) -> bool:
+            """Bind the wake gate's "is this worker gone" question to the slot table.
+
+            A second binding rather than a second return value from the one above,
+            because the two answers are read at different strengths: a running worker
+            suppresses a stall wake, a closed one causes it without waiting out the
+            window. The logic is ``ledger_wake.worker_closed``, for the reason its
+            sibling gives -- a closure in this constructor is unreachable from a test.
+            """
+            from kiro_crew import ledger_wake
+
+            return ledger_wake.worker_closed(self.dashboard_state, session_key)
+
         self.autonudge_svc = AutoNudgeService(
             base_dir=data_home(),
             on_fire=_fire,
             on_monitor_tick=_monitor_tick,
             collect_judge_evidence=_collect_judge_evidence,
             emit_judge_notice=_emit_judge_notice,
+            worker_running=_worker_slot_running,
+            worker_closed=_worker_slot_closed,
         )
 
         def _monitor_owner_session_id(loop: NudgeLoop) -> str:

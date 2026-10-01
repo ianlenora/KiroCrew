@@ -163,11 +163,11 @@ _BASE_REACHED_IMPORTS = frozenset(
 #: twelve hex digits of the SHA-256 of ``_signature_text`` -- every parameter, ``self``/``cls``
 #: included, with its kind, default and annotation, and the return annotation.
 _BASE_SERVICE_MEMBERS: dict[str, tuple[str, str]] = {
-    "__init__": ("method", "3936a319f704"),
+    "__init__": ("method", "38ac57f125dd"),
     "_acquire_mutation_lock": ("method+async", "e26080a5a8bc"),
-    "_add_locked": ("method+async", "aa78b4f88266"),
+    "_add_locked": ("method+async", "923a1f34e18b"),
     "_add_monitor_locked": ("method+async", "55179b26aeff"),
-    "_add_unserialized": ("method+async", "aa78b4f88266"),
+    "_add_unserialized": ("method+async", "923a1f34e18b"),
     "_append_judge_labels": ("method", "05f9e694d3d7"),
     "_apply_monitor_budget_stop": ("method", "c05b26fec956"),
     "_apply_monitor_user_stop": ("method", "0d02c6c3b88e"),
@@ -224,22 +224,28 @@ _BASE_SERVICE_MEMBERS: dict[str, tuple[str, str]] = {
     "_sync_terminal_completion_timer": ("method", "fa9fb3019298"),
     "_terminal_still_holds": ("method+async", "75f382f079fb"),
     "_timer": ("method+async", "e290ef84f151"),
-    "_update_locked": ("method+async", "ee9cb229b3ef"),
-    "_update_unserialized": ("method+async", "ee9cb229b3ef"),
+    "_update_locked": ("method+async", "b7b62a00f723"),
+    "_update_unserialized": ("method+async", "b7b62a00f723"),
     "_waits_for_terminal_completion": ("method", "3a33d55b099b"),
     "_withdraw_judge_suppression": ("method", "fa9fb3019298"),
+    "_worker_running": ("method", "490393185551"),
+    # The close side of the same liveness question, injected the same way.
+    "_worker_closed": ("method", "490393185551"),
+    # Reads one loop's monitor kind: the startup resume treats a work-ledger
+    # watch differently, because its news arrives by a push a restart loses.
+    "_observes_work_ledger": ("method", "3a33d55b099b"),
     "_write_monitor_snapshot_locked": ("method+async", "048a7479cdcf"),
     "_write_quarantine_rows": ("method", "54f84a64e0fe"),
     "_write_quarantine_sidecar": ("method", "35d06f40fb45"),
     "_write_quarantine_sidecar_locked": ("method", "35d06f40fb45"),
     "_write_state": ("method", "b02c548f23ec"),
-    "add": ("method+async", "c8323cf13a95"),
+    "add": ("method+async", "d723f7c062d9"),
     "add_monitor": ("method+async", "b07c1299b741"),
     "apply_monitor_probe": ("method+async", "7e318e77ec64"),
     "clear_terminal_monitor": ("method+async", "82db71923663"),
     "commit_monitor_replacement": ("method", "f7956b1e6531"),
     "deactivate_and_wait": ("method+async", "61dc2e194fa8"),
-    "fire_now": ("method+async", "c7320d325386"),
+    "fire_now": ("method+async", "082992b0b249"),
     "get_by_id": ("method", "c7cdaf3c2920"),
     "get_by_slot": ("method", "1a9a46af4d72"),
     "list_all": ("method", "6672df12a725"),
@@ -271,7 +277,7 @@ _BASE_SERVICE_MEMBERS: dict[str, tuple[str, str]] = {
     "stop_monitor": ("method+async", "bddc1c278f12"),
     "stop_monitor_if_budget_exhausted": ("method+async", "7ab50d99dd32"),
     "subscribe": ("method", "7a1b8e1c52f1"),
-    "update": ("method+async", "ee9cb229b3ef"),
+    "update": ("method+async", "b7b62a00f723"),
     "update_monitor": ("method+async", "15a27e52eef4"),
 }
 
