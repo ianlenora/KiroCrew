@@ -2125,9 +2125,9 @@ async def api_chat_folder_delete(request: web.Request) -> web.Response:
     # Each was closable in isolation; the class was not.
     #
     # Nothing shipped loses a capability: the one MCP tool that reaches this
-    # route, chat_folder_delete, deletes only an EMPTY folder and is refused
-    # here for an app like any other app caller, so its working callers are
-    # the person's own sessions and the dashboard UI. An app organizes its own work by
+    # route, chat_folder_delete, sends ``if_empty`` (below) and is refused here
+    # for an app like any other app caller, so its working callers are the
+    # person's own sessions and the dashboard UI. An app organizes its own work by
     # creating, renaming and reparenting its folders and filing its sessions --
     # cleanup is the person's, who can delete a full folder as they always could.
     if request_app:
@@ -2149,6 +2149,58 @@ async def api_chat_folder_delete(request: web.Request) -> web.Response:
             },
             status=403,
         )
+    # ``?if_empty=true`` is the empty-only delete the chat_folder_delete MCP tool
+    # sends. It never unfiles a slot or lifts a subfolder: occupancy is answered
+    # where the removal happens. Live slots and child folders are re-checked
+    # inside the folder-store callback below, which runs synchronously under the
+    # store lock and removes the row from the live list in the same step, so a
+    # slot PATCH or a child create cannot land between the check and the removal
+    # (both refuse a folder that is absent from the live list). Archived
+    # sessions are counted first, off the loop, because that is a disk scan; a
+    # session that is filed AND closed inside that one scan is the residue, and
+    # its transcript keeps a folder id that every reader renders as unfiled.
+    if_empty = (request.query.get("if_empty") or "").strip().lower() in ("1", "true", "yes")
+    if if_empty:
+        loop = asyncio.get_running_loop()
+        archived = await loop.run_in_executor(subprocess_executor(), _folder_history_counts, state)
+        if archived.get(fid, 0):
+            return web.json_response(
+                {
+                    "error": "folder still holds archived sessions",
+                    "code": "folder_not_empty",
+                },
+                status=409,
+            )
+
+        def _remove_if_empty(folders: list[dict[str, Any]]) -> tuple[bool, str]:
+            if not any(f.get("id") == fid for f in folders):
+                return False, "gone"
+            if any(f.get("parent_id") == fid for f in folders):
+                return False, "folder has subfolders"
+            if any(slot.folder_id == fid for slot in state._slots.values()):
+                return False, "folder still holds live sessions"
+            folders[:] = [f for f in folders if f["id"] != fid]
+            return True, ""
+
+        refused = await state.mutate_folders(_remove_if_empty)
+        if refused == "gone":
+            return web.json_response({"error": "not found", "code": "folder_not_found"}, status=404)
+        if refused:
+            return web.json_response({"error": refused, "code": "folder_not_empty"}, status=409)
+        _CHAT_FOLDER_ICON_EPOCHS.pop(fid, None)
+        pending_icon = _CHAT_FOLDER_PENDING_ICON_TASKS.pop(fid, None)
+        if pending_icon is not None and not pending_icon.done():
+            pending_icon.cancel()
+        state.push_slots_update()
+        source, caller = _audit_origin(request)
+        sel().log_api_access(
+            caller=caller,
+            operation="chat.folder_delete",
+            outcome="allowed",
+            source=source,
+            resources=fid,
+        )
+        return web.json_response({"ok": True})
     # Unfile the folder's slots first, then commit the folder removal. If that
     # commit fails, put the slots back: otherwise the delete half-lands —
     # conversations persistently unfiled while the folder they came from is

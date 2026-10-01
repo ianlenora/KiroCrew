@@ -511,8 +511,9 @@ Folder moves are metadata only: the session keeps its transcript, its model, and
 any running turn. Archived (history) sessions cannot be moved — bring one back
 with `session_revive` first.
 
-`chat_folder_delete` removes only a folder with nothing in it, so it never
-unfiles a session or lifts a subfolder to the top level. Empty the folder first
+`chat_folder_delete` removes only a folder with nothing in it. The dashboard
+checks for subfolders and live sessions in the same locked step that removes
+the folder, and refuses rather than unfiling anything. Empty the folder first
 with `chat_folder_move` and `chat_folder_move_session`. Only the person's own
 sessions may call it: the dashboard refuses an app agent or a crew member.
 
