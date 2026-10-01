@@ -111,6 +111,26 @@ async def test_internal_spawn_parent_must_match_caller_identity(
 
 
 @pytest.mark.asyncio
+async def test_identityless_internal_spawn_without_parent_is_admitted(env):
+    """``kirocrew spawn run`` sends no X-Session-Key and no parent_session.
+
+    That caller is a verified Global identity; its absent session and its empty
+    claimed parent both mean "no session" and must not read as a mismatch.
+    """
+    from kiro_crew.dashboard.handlers import messaging
+
+    env.state.subagents = SimpleNamespace(
+        spawn=mock.Mock(return_value=SimpleNamespace(id="run-1", done=False))
+    )
+    response = await messaging.api_spawn(
+        request(env, body={"task": "spawn"}, internal=True, session="")
+    )
+    assert response.status == 200, response.text
+    env.state.subagents.spawn.assert_called_once()
+    assert not env.state.subagents.spawn.call_args.kwargs.get("memory_store")
+
+
+@pytest.mark.asyncio
 async def test_private_taskrunner_start_forwards_protected_origin(env):
     from kiro_crew.execution_context import read_session_execution
 

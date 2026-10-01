@@ -633,8 +633,16 @@ async def api_spawn(request: web.Request) -> web.Response:
             {"error": "parent_session must be a string", "code": "invalid_parent_session"},
             status=400,
         )
+    # ``kirocrew spawn run`` sends neither X-Session-Key nor parent_session. Its
+    # verified scope has session=None, and comparing that with the body default
+    # "" refused every CLI spawn with 409. With no header AND no parent there is
+    # no session to claim, so claim none; any non-empty parent, or a caller that
+    # has a session, keeps the exact-match check.
+    claimed_parent: str | None = parent_session
+    if not parent_session and not request.headers.get("X-Session-Key", ""):
+        claimed_parent = None
     _, refusal = await internal_memory_scope(
-        request, "spawn.create", claimed_session=parent_session
+        request, "spawn.create", claimed_session=claimed_parent
     )
     if refusal is not None:
         return refusal
