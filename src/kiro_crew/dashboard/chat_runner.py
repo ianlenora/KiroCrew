@@ -1178,6 +1178,21 @@ async def _steer_policy_notice(
     return True
 
 
+async def _reject_attributed(client: Any, request_id: Any, *, attribution: str) -> None:
+    """Answer a permission request with a rejection whose attribution is stated.
+
+    kiro-cli tells the model "User denied tool execution" for EVERY rejection,
+    which is false for a host deny. Outside the ``_reject_*`` helpers above,
+    every answer site in this module goes through here and must say how the
+    model learns the real cause: ``"steered"`` when a ``_steer_policy_notice``
+    precedes this answer on every path, or ``"exempt: <why>"`` when the generic
+    message is TRUE on the path left unsteered (a provenance-gated steer names
+    the branch it leaves alone). Keyword-only and required, so a new site that
+    omits it is a mypy error; test_refusal_inband_notice.py checks the value.
+    """
+    await client.reject_tool(request_id)
+
+
 async def _reject_hook_blocked(
     client: Any,
     slot: Any,
@@ -15405,7 +15420,7 @@ async def _run_chat(
                         await _steer_policy_notice(
                             client, _deny_title, _deny_msg, _refusal_notices, slot, state
                         )
-                        await client.reject_tool(event.request_id)
+                        await _reject_attributed(client, event.request_id, attribution="steered")
                         slot.append(
                             "tool",
                             f"🚫 {_deny_title} — {_deny_msg}",
@@ -16077,7 +16092,7 @@ async def _run_chat(
                             [],
                             cause=DENY_CAUSE_BATCH_CASCADE,
                         )
-                    # deny-notice-exempt: user-originated cascade. When the
+                    # User-originated cascade. When the
                     # person themselves denied the tool that started this
                     # cascade, that refusal covers the group they refused, so
                     # kiro-cli's "User denied tool execution" is the TRUE
@@ -16085,7 +16100,9 @@ async def _run_chat(
                     # host notice would re-attribute the user's own decision.
                     # Host-caused cascades are corrected by the
                     # provenance-gated steer above.
-                    await client.reject_tool(event.request_id)
+                    await _reject_attributed(
+                        client, event.request_id, attribution="exempt: user-originated cascade"
+                    )
                     slot.append(
                         "tool", f"🚫 {_title} (rejected)", "msg msg-tool", meta=_tool_meta(event)
                     )
@@ -16764,7 +16781,7 @@ async def _run_chat(
                             [],
                             cause=_host_deny_cause,
                         )
-                    # deny-notice-exempt: interactive user denial. The person
+                    # Interactive user denial. The person
                     # clicked Reject (or "reject once"), so kiro-cli's "User
                     # denied tool execution" is the true and correct attribution
                     # here — the sharpest case in the class, because steering a
@@ -16774,7 +16791,9 @@ async def _run_chat(
                     # above never fires for it and this exemption stays true for
                     # exactly the branch it covers; the host auto-declines are
                     # that steer's job, not this marker's.
-                    await client.reject_tool(event.request_id)
+                    await _reject_attributed(
+                        client, event.request_id, attribution="exempt: interactive user denial"
+                    )
                     if _safety_reason:
                         _reject_label = f"🚫 {_safe_reject_title} (cancelled — {_safety_reason})"
                     elif outcome == "rejected_once":
