@@ -1296,6 +1296,43 @@ against sweep completeness, and are torn down at `close_all`.
   backward scan skips it). Idle/orphan sweeps do NOT fire the recycle
   callback. Linux-only measurement (`get_session_rss_mb` returns 0 elsewhere),
   so the feature is inert off-Linux.
+- **Harness background work** (`CleanupDeps.provider_background_launch`,
+  `HARNESS_BACKGROUND_WORK_HOLD_SECS` = 3600 s,
+  `HARNESS_BACKGROUND_WORK_HARD_CEILING_FACTOR` = 2): a free semaphore only proves Kiro
+  Crew's own prompt returned. Claude Code runs a backgrounded Bash command or a
+  Workflow in the session's process tree after the prompt answers `end_turn`,
+  and neither the semaphore nor the sub-agent probe can see it. claude-agent-acp
+  reports the launch on the launching call's PostToolUse `tool_call_update`, as
+  `_meta.claudeCode.toolResponse` carrying `backgroundTaskId` (Bash) or
+  `status: "async_launched"` with a `taskId` (Workflow);
+  `_dispatch.parse_background_launch` reads exactly those structured fields, and
+  skips an `Agent`/`Task` launch because the adapter holds the prompt open until
+  such a sub-agent settles. Only `AcpClient` — the transport that serves claude,
+  the one harness whose adapter stamps the marker — keeps a per-session
+  `BackgroundLaunchRecord` today (the `AcpSessionHandle` runtime serves only
+  backends that never stamp `_meta.claudeCode`), never reset per turn, exposed as
+  `background_launch()` -> `(seconds since, description)` through the provider
+  chain. Nothing the adapter sends a client without its AIR extension marks the
+  END of that work: a live capture shows a quiet run sends nothing between
+  `end_turn` and the model waking to report it. So the hold is bounded by time.
+  The RSS recycle, as its last synchronous read before `reset`, and the idle
+  sweep, as a post-await re-judge on both axes, keep a session whose newest
+  launch is inside the hold. Past it the ceiling applies again and the recycle
+  notice stays the plain memory-limit reason: letting the recycle through past
+  the hold presumes the launched work finished, and the record is never cleared
+  while the process lives, so naming a launch from hours ago would be permanent
+  noise. The record IS cleared by `AcpClient._reset_state` — the work dies with
+  the process whose harness started it, so a respawn on the same client must
+  not inherit the dead tree's hold. The hold cannot
+  override memory without bound: every launch refreshes its clock, so a session
+  that keeps launching work would renew it forever. Inside the hold the RSS
+  recycle therefore still proceeds when the tree exceeds
+  `rss_max_mb * HARNESS_BACKGROUND_WORK_HARD_CEILING_FACTOR` (2x — observed
+  real workflow trees ran 2398-2641 MB against the 1536 MB default ceiling, so
+  the hold must survive those while still cutting off a runaway), and the
+  notice still names the work. The idle sweep is not memory-driven, so its hold
+  has no such ceiling. The probe is not fail-closed: a missing or unreadable
+  answer is "nothing launched".
 
 ## APIs
 

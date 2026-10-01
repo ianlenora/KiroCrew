@@ -2594,6 +2594,12 @@ class AcpProvider(LLMProvider):
         """True if a prompt is in flight (and not yet cancelled) on the client."""
         return bool(self._client) and self._client.has_active_turn()
 
+    def background_launch(self) -> tuple[float, str] | None:
+        """The client's newest background launch, or ``None`` (see base)."""
+        if not self._client:
+            return None
+        return self._client.background_launch()
+
     def has_unfinished_turn(self) -> bool:
         """True if the client reports a native turn that has NOT reached its
         done boundary — INDEPENDENT of cancel state (unlike

@@ -65,6 +65,7 @@ from kiro_crew.acp import runtime_models, runtime_process_tree, seed_provenance,
 from kiro_crew.acp._dispatch import (
     ACP_BACKENDS_META_IDENTITY,
     DRAIN_YIELD_AFTER_S,
+    BackgroundLaunchRecord,
     _dumps_degraded,
     _loggable_request_id,
     _measure_tool_output,
@@ -3714,6 +3715,12 @@ class AcpClient:
         # ``session/prompt`` request goes unanswered -- which leaves this armed
         # for ``_settle_codex_compaction`` to close out at the turn's terminal.
         self._codex_compaction_pending: bool = False
+        # When this session's harness last launched work that outlives the
+        # prompt (a backgrounded command, a Workflow). Never reset per turn: a
+        # turn ending says nothing about whether that work has finished, and
+        # this client reads its pipe only while a call is waiting, so the
+        # harness's eventual report of it is not seen until the next prompt.
+        self._background_launches = BackgroundLaunchRecord()
         # Liveness oracle for the stale-turn gate: before ending a silent turn
         # at _STALE_TURN_TIMEOUT, consult /proc evidence so a backend that is
         # provably working (CPU/IO movement in the subprocess subtree) is not
@@ -8611,6 +8618,13 @@ class AcpClient:
         # replacement process, so release it with the oracle it sampled into.
         self._retire_liveness_state()
         self._session_id = None
+        # The launches this record holds died with the process whose harness
+        # started them (a backgrounded command or Workflow runs in that
+        # process's own tree). Carrying it across a respawn would grant the
+        # FRESH tree the watchdog's background-work hold — and its hard-ceiling
+        # grace — on behalf of work that is already dead. "Never reset per
+        # turn" (see __init__) is a statement about turns, not processes.
+        self._background_launches = BackgroundLaunchRecord()
         # The adapter's cumulative cost counter is in-process: a replacement
         # process restarts it at zero, so the delta baseline must restart with
         # it or spend up to the old total is silently dropped — the monotonic
@@ -10471,6 +10485,7 @@ class AcpClient:
                     await self._reject_unknown_server_request(msg)
                 elif action == "update":
                     self._track_usage_update(msg)
+                    self._note_background_launch(msg)
                     # Apply the codex compaction state change; this API yields
                     # str so the event has nowhere to go, but the context counts
                     # it drops are what the meter reads next turn.
@@ -10680,6 +10695,7 @@ class AcpClient:
                 await self._reject_unknown_server_request(msg)
             elif action == "update":
                 self._track_usage_update(msg)
+                self._note_background_launch(msg)
                 # codex reports compaction as a marked tool_call pair rather than
                 # as text, so it is read off the FRAME here instead of off a
                 # chunk below. Yielded and then fallen through: the frame is
@@ -11359,6 +11375,23 @@ class AcpClient:
         await asyncio.wait_for(self._turn_done.wait(), timeout=timeout)
         return self._last_stop_reason
 
+    def _note_background_launch(self, msg: JsonRpcMessage) -> None:
+        """Record a background launch the harness reports on this frame, if any."""
+        params = msg.params if isinstance(msg.params, dict) else {}
+        if self._background_launches.note(params.get("update"), time.monotonic()):
+            logger.info(
+                "ACP: harness launched background work for this session: %s",
+                self._background_launches.describe(),
+            )
+
+    def background_launch(self) -> tuple[float, str] | None:
+        """``(seconds since, description)`` of this session's newest background
+        launch, or ``None`` when its harness reported none (see LLMProvider)."""
+        age = self._background_launches.age(time.monotonic())
+        if age is None:
+            return None
+        return age, self._background_launches.describe()
+
     def has_active_turn(self) -> bool:
         """True if a prompt is in flight AND has not yet been cancelled.
 
@@ -11437,6 +11470,7 @@ class AcpClient:
                 await self._reject_unknown_server_request(msg)
             elif action == "update":
                 self._track_usage_update(msg)
+                self._note_background_launch(msg)
                 # See send_message_stream: settle the codex compaction for the
                 # context counts, drop the event this API cannot return.
                 self._codex_compaction_event(msg)
