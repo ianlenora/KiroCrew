@@ -8131,3 +8131,17 @@ class TestOpenLockFileForSweep:
         with pytest.raises(OSError):
             pc.open_lock_file_for_sweep(r"C:\agents\alias.lock")
         assert closed == [0x1234]
+
+
+class TestProcSubtreePss:
+    def test_an_absent_or_unreadable_root_reads_as_unmeasured(self) -> None:
+        assert pc.proc_subtree_sample(None, pss=True).pss_kb == -1
+        assert pc.proc_subtree_sample(0, pss=True).pss_kb == -1
+
+    @pytest.mark.skipif(not pc.IS_LINUX, reason="smaps_rollup is Linux-only")
+    def test_this_process_has_a_positive_pss(self) -> None:
+        import os
+
+        if not os.path.exists(f"/proc/{os.getpid()}/smaps_rollup"):
+            pytest.skip("kernel without smaps_rollup")
+        assert pc.proc_subtree_sample(os.getpid(), rss=False, jiffies=False, pss=True).pss_kb > 0
