@@ -482,7 +482,55 @@ def _verified_loopback_gateway_pids(port: int) -> list[int]:
     return [pid]
 
 
-def _stop(cli_port: int | None = None) -> None:
+def _stop_expected_pid(port: int, expect_pid: int) -> None:
+    """SIGTERM ``expect_pid`` only while it is provably this home's gateway on ``port``.
+
+    Three facts, all read here, immediately before the signal: ``expect_pid`` is
+    the sole listener on ``port``, it looks like a Kiro Crew gateway, and it is the
+    live holder of this home's ``gateway.lock``. A caller that identified a
+    gateway earlier names it by pid, so a listener that replaced it in between
+    -- another home's gateway, or a fresh one -- is refused instead of stopped.
+    Every refusal signals nothing and exits 1.
+    """
+
+    def refuse(reason: str, message: str) -> NoReturn:
+        sel().log_api_access(
+            caller="cli",
+            operation="gateway_stop",
+            outcome="denied",
+            source="cli",
+            resources=f"port={port} expect_pid={expect_pid} reason={reason}",
+        )
+        print(f"❌ {message} Not signalling anything.")
+        sys.exit(1)
+
+    def check_listener() -> None:
+        listeners = platform_compat.find_listening_pids(port)
+        if listeners != [expect_pid]:
+            shown = ", ".join(str(p) for p in listeners) or "nothing"
+            refuse(
+                "listener_mismatch",
+                f"Port {port} is held by {shown}, not by the expected pid {expect_pid}.",
+            )
+
+    check_listener()
+    if not _is_kirocrew_process(expect_pid):
+        refuse("not_kirocrew", f"Pid {expect_pid} does not look like a Kiro Crew gateway.")
+    try:
+        holder = lock_holder(config_dir())
+    except LockProbeError as exc:
+        refuse("lock_probe_indeterminate", f"{exc}.")
+    if holder.pid != expect_pid or not holder.alive:
+        refuse(
+            "lock_holder_mismatch",
+            f"Pid {expect_pid} does not hold this home's gateway lock.",
+        )
+    check_listener()
+
+    _terminate_gateway_pids(port, [expect_pid], via=" via=expect_pid")
+
+
+def _stop(cli_port: int | None = None, *, expect_pid: int | None = None) -> None:
     """Stop a running KiroCrew gateway.
 
     Accepts the raw CLI ``--port`` value (``None`` when not passed).
@@ -493,7 +541,16 @@ def _stop(cli_port: int | None = None) -> None:
     - ``cli_port is not None``: user explicitly targeted a port, so we
       bypass the service short-circuit and SIGTERM the gateway bound to
       that port directly.
+
+    ``expect_pid`` (CLI ``--expect-pid``, only together with ``--port``) narrows
+    the stop to that one pid; see :func:`_stop_expected_pid`.
     """
+    if expect_pid is not None:
+        if cli_port is None:
+            print("❌ --expect-pid needs --port. Not signalling anything.")
+            sys.exit(2)
+        _stop_expected_pid(resolve_client_port(cli_port), expect_pid)
+        return
     port = resolve_client_port(cli_port)
     if cli_port is None and service_controller.stop_service():
         sel().log_api_access(
@@ -649,6 +706,16 @@ def _stop(cli_port: int | None = None) -> None:
         )
         sys.exit(1)
 
+    _terminate_gateway_pids(port, pids)
+
+
+def _terminate_gateway_pids(port: int, pids: list[int], via: str = "") -> None:
+    """Signal *pids* (identified gateways on *port*) and report the outcome.
+
+    Shared by the plain ``--port`` stop and the ``--expect-pid`` stop, so both
+    end in the same signal loop. Exits 1 when nothing was stopped or a pid
+    could not be signalled.
+    """
     sent: set[int] = set()
     denied: list[int] = []
     for pid in pids:
@@ -693,7 +760,7 @@ def _stop(cli_port: int | None = None) -> None:
             operation="gateway_stop",
             outcome="allowed",
             source="cli",
-            resources=f"pids={sorted(sent)} port={port}",
+            resources=f"pids={sorted(sent)} port={port}{via}",
         )
         _verb = "Terminated" if platform_compat.IS_WINDOWS else "Sent SIGTERM to"
         print(f"✅ {_verb} gateway (pid {', '.join(str(p) for p in sorted(sent))}).")
