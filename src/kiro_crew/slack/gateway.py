@@ -6594,8 +6594,18 @@ class GatewayOrchestrator:
                 # Attempt one retry for ACP process death before any dedup / alert.
                 exc_msg = str(exc).lower()
                 if (
-                    isinstance(exc, AcpError)
-                    and ("not running" in exc_msg or "process exited" in exc_msg)
+                    # Match the death by type: the pipe-broken raise sites in
+                    # acp/client.py word it "pipe broken", which no substring
+                    # below covers. The typed arm is held to before dispatch,
+                    # where no tool can have run yet, so a retry never replays
+                    # side effects. The substrings keep their old reach.
+                    (
+                        (isinstance(exc, AcpProcessDied) and not _prompt_dispatched)
+                        or (
+                            isinstance(exc, AcpError)
+                            and ("not running" in exc_msg or "process exited" in exc_msg)
+                        )
+                    )
                     and not getattr(job, "_acp_retried", False)
                     and self.sessions is not None
                 ):
