@@ -7177,9 +7177,28 @@ def _clear_readonly_and_retry(func: Any, path: str, _exc: BaseException) -> None
     POSIX consults the parent directory's write bit. So a mode-``444`` file — of
     which a git checkout is full, since loose objects are written read-only —
     cannot be unlinked on Windows even when its directory is writable.
+
+    Only Windows gets the chmod, and only for an entry that is not a link. On
+    POSIX the entry's own mode never decides whether it can be removed, so a
+    chmod there buys nothing, and ``os.chmod`` follows a symlink: a tree an
+    agent wrote could aim one at any file this process can reach and have its
+    mode rewritten. The write bit is ADDED to the current mode, never set in
+    its place, so a failed retry leaves a directory still listable.
+
+    Only a removal (``unlink``/``rmdir``) is retried. ``rmtree`` also reports a
+    directory it could not open or list (``os.open``, ``os.scandir``, ...);
+    the read-only bit is not why those failed, and ``os.open(path)`` called
+    with ``path`` alone raises ``TypeError``, which would unwind past
+    ``rmtree_force``'s "never raises" contract. Those are logged and left.
     """
+    if func not in (os.unlink, os.remove, os.rmdir):
+        logger.warning("Cannot remove %s", path)
+        return
     try:
-        os.chmod(path, stat.S_IWRITE)
+        if not IS_POSIX:
+            info = os.lstat(path)
+            if not (stat.S_ISLNK(info.st_mode) or lstat_is_name_surrogate(info)):
+                os.chmod(path, stat.S_IMODE(info.st_mode) | stat.S_IWRITE)
         func(path)
     except OSError:
         logger.warning("Cannot remove %s", path)
@@ -7285,6 +7304,25 @@ def _is_junction_fallback(path: str | os.PathLike) -> bool:
     if not attrs & _FILE_ATTRIBUTE_REPARSE_POINT:
         return False
     return getattr(info, "st_reparse_tag", 0) == _IO_REPARSE_TAG_MOUNT_POINT
+
+
+#: ``IsReparseTagNameSurrogate``: set on a reparse tag whose entry stands for
+#: ANOTHER name (a symlink, a junction), clear on one that stores its own data in
+#: place (a cloud-files placeholder, a dedup or container-isolation directory).
+_IO_REPARSE_TAG_NAME_SURROGATE = 0x20000000
+
+
+def lstat_is_name_surrogate(info: os.stat_result) -> bool:
+    """True when an ``lstat`` result is a Windows link to another name.
+
+    A tree walk that must stay inside its tree skips exactly these: ``lstat``
+    reports a junction as a plain directory, so ``S_ISDIR`` alone walks into
+    its target. A reparse directory WITHOUT the name-surrogate bit holds its
+    own contents, which a walk must still see -- skipping it would hide writes
+    made inside it. ``st_reparse_tag`` is Windows-only, so this is False on
+    POSIX, where ``lstat`` already reports a symlink as a link.
+    """
+    return bool(getattr(info, "st_reparse_tag", 0) & _IO_REPARSE_TAG_NAME_SURROGATE)
 
 
 def strip_extended_length_prefix(path: Path) -> Path:
