@@ -851,7 +851,11 @@ class TestStateFilePermissions:
                 st_file.chmod(0o644)
             _save_state(TipsState())
             if sys.platform == "win32":
-                assert st_file.is_file()
+                # No POSIX bits on Windows, so assert the rewrite actually
+                # landed instead: the seeded "{}" has no keys, so a skipped
+                # rewrite would leave "pool_id" absent and this would fail.
+                written = json.loads(st_file.read_text())
+                assert "pool_id" in written
                 return
             assert (st_file.stat().st_mode & 0o777) == 0o600
 
