@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import asyncio.proactor_events
 import json
 import os
 import pathlib
@@ -51,6 +52,51 @@ if os.name == "nt":
         _loop_factory = _WindowsTestProactorEventLoop
 
     asyncio.set_event_loop_policy(_WindowsTestEventLoopPolicy())
+
+#: What the proactor loop's self-pipe needs. ``_make_self_pipe`` calls
+#: ``socket.socketpair`` through ``asyncio.proactor_events.socket``, and the Windows
+#: fallback compares its family against the module-global ``AF_INET``/``AF_INET6`` at
+#: call time. One of these left rebound makes every later ``new_event_loop()`` on the
+#: worker raise, so pytest-asyncio's ``event_loop`` finalizer fails every remaining
+#: async test in the shard with "Event loop is closed".
+_SOCKET_STATE = (
+    (socket, "socket"),
+    (socket, "socketpair"),
+    (socket, "AF_INET"),
+    (socket, "AF_INET6"),
+    (asyncio.proactor_events, "socket"),
+)
+_SOCKET_STATE_KEY = pytest.StashKey[tuple]()
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    item.stash[_SOCKET_STATE_KEY] = tuple(getattr(m, n) for m, n in _SOCKET_STATE)
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None):
+    """Put back socket state a test left rebound, then fail that test by name.
+
+    A tripwire, not a leak finder: it stops one leak from killing the shard and names
+    the test that left it. A hook rather than an autouse fixture because it must read
+    the state after the test's ``monkeypatch`` has undone; autouse fixtures in one
+    conftest are set up in alphabetical order and an earlier one already requests
+    ``monkeypatch``, so a fixture here would be torn down first.
+    """
+    leaked: list[str] = []
+    try:
+        result = yield
+    finally:
+        before = item.stash.get(_SOCKET_STATE_KEY, None)
+        for (module, name), value in zip(_SOCKET_STATE, before or ()):
+            if getattr(module, name, None) is not value:
+                setattr(module, name, value)
+                leaked.append(f"{module.__name__}.{name}")
+    if leaked:
+        pytest.fail(f"test left {', '.join(leaked)} rebound (restored)", pytrace=False)
+    return result
+
 
 # ── Hypothesis profiles ─────────────────────────────────────────────────
 # Default (CI): fast iteration.  Run ``HYPOTHESIS_PROFILE=thorough python -m pytest``
