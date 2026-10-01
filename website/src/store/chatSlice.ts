@@ -337,6 +337,14 @@ function applyNonActiveFrame(
 /** The ACTIVE-slot half of `sseChatMessage`, kept apart from the background
  *  half above (`applyNonActiveFrame`) so the main chat's path is unchanged by
  *  it. */
+/** Count a live frame that is about to change the ACTIVE view (see
+ *  `ChatState.liveFrameSeq`). Called on each branch of `applyActiveFrame` only
+ *  once that frame is known to reduce -- after the replay floor and the
+ *  redelivery guard -- so a dropped replay stays a true no-op. */
+function countLiveFrame(state: ChatState): void {
+  state.liveFrameSeq = (state.liveFrameSeq ?? 0) + 1
+}
+
 function applyActiveFrame(state: ChatState, p: ChatFrame): void {
   const { slot, role, ts, seq, gen, cls, meta, kind, batched, parts } = p
   let content = p.content
@@ -345,12 +353,14 @@ function applyActiveFrame(state: ChatState, p: ChatFrame): void {
   if (effectiveKind === 'stop_event') {
     const id = (meta?.id as string) ?? ''
     const idx = id ? state.messages.findIndex(m => m.meta?.id === id) : -1
+    countLiveFrame(state)
     const msg: ChatMessage = ensureMsgId({ role, content, cls: cls || '', ts, meta: { ...meta, kind: 'stop_event' }, kind: 'stop_event' })
     if (idx >= 0) { state.messages[idx] = msg } else { state.messages.push(msg) }
     return
   }
   // WS segment — finalize streaming into assistant without resetting sequence or slot state
   if (role === '_segment') {
+    countLiveFrame(state)
     finalizeTrailingStreaming(state.messages)
     return
   }
@@ -377,6 +387,7 @@ function applyActiveFrame(state: ChatState, p: ChatFrame): void {
     if (state.slotState === 'idle') bumpRunEpoch(state, slot)
     state.slotState = 'streaming'
     state._wsChunkedDuringFetch = true
+    countLiveFrame(state)
     // Drop only the empty "Thinking…" placeholder; keep content-bearing
     // reasoning blocks (from chat_thinking) so they persist as a collapsible
     // trace directly above the streamed answer.
@@ -408,6 +419,7 @@ function applyActiveFrame(state: ChatState, p: ChatFrame): void {
   }
   // WS done — finalize streaming into assistant, rawText preserved for reparse
   if (role === '_done') {
+    countLiveFrame(state)
     state.slotState = 'idle'
     state.lastChunkSeq = undefined
     for (let i = state.messages.length - 1; i >= 0; i--) {
@@ -459,6 +471,7 @@ function applyActiveFrame(state: ChatState, p: ChatFrame): void {
   // trailing `streaming` row, so a late redelivery of an OLD assistant frame
   // would clobber the live content of a NEW segment already streaming.
   if (isRedeliveredMessage(state.messages, effectiveMeta)) { state._redeliveredFramesDropped += 1; return }
+  countLiveFrame(state)
   // A turn-consuming frame makes a pending stateless question card stale —
   // placed after the redelivery guard so a replayed frame cannot clear a
   // live card (see dropStaleStatelessQuestion).
@@ -877,6 +890,7 @@ export {
 } from './chat/selectors'
 export { clearSwitchSlotGone, switchSlot, switchSlotNoticeCopy, type SwitchSlotArg } from './chat/slotSwitch'
 export { refreshSlot, warmSlotCache } from './chat/slotRefresh'
+export { WINDOW_WALK_MAX_PAGES } from './chat/windowWalk'
 export { createSlot, deleteHistorySession, fetchHistory, forkSlot, resumeFromHistory } from './chat/lifecycle'
 
 export default chatSlice.reducer
