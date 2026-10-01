@@ -946,6 +946,12 @@ def _restore_autonudge_singleton():
         _an._INSTANCE = inherited
 
 
+#: How long a test's teardown waits for the member event-log writes it queued. A
+#: slow runner disk retires each queued append in tens of milliseconds, so this is
+#: generous; a queue that does not drain in it is a wedge worth failing on.
+_MEMBER_EVENTLOG_DRAIN_SECONDS = 30.0
+
+
 @pytest.fixture(autouse=True)
 def _reset_member_eventlog_singleton():
     """Reset ``eventlog.service`` process-global singleton at each test boundary.
@@ -970,14 +976,37 @@ def _reset_member_eventlog_singleton():
     other singleton floors here -- production genuinely publishes this reference, and
     a test driving that code cannot avoid inheriting it; stopping the leak from
     reaching the next test is the part that is not optional.
+
+    Teardown first DRAINS the member event-log writes the test queued. Dashboard DM
+    messages and slot transitions reach the log through ``eventlog_hooks.submit``:
+    one process-wide worker thread that is otherwise drained only at interpreter
+    exit. Undrained, a test's queued write runs during whatever test comes next on
+    the worker, resolves the crew-log root at run time, and so opens that member's
+    log -- holding its open lock -- inside the NEXT test's home. A test there that
+    touches the same member from the event-loop thread meets the held lock, and
+    ``file_lock`` on the loop thread makes one attempt and refuses: the
+    ``record_activity(...) == False`` red. This fixture's teardown runs before the
+    home pin is undone, so every queued write lands in the home of the test that
+    queued it; a queue that does not drain in time fails the test that filled it,
+    not whichever test would have inherited the work. The drain is bound at SETUP:
+    tests of the shutdown path replace ``drain_for_shutdown`` with a wedged or
+    recording stand-in, and that patch is still in place when this teardown runs.
     """
+    from kiro_crew import eventlog_hooks
     from kiro_crew.eventlog import service as _svc
 
+    drain = eventlog_hooks.drain_for_shutdown
     _svc.set_service(None)
     try:
         yield
     finally:
+        drained = drain(_MEMBER_EVENTLOG_DRAIN_SECONDS)
         _svc.set_service(None)
+        if not drained:
+            raise TimeoutError(
+                "queued member event-log writes did not finish within "
+                f"{_MEMBER_EVENTLOG_DRAIN_SECONDS:.0f}s of the test that queued them"
+            )
 
 
 @pytest.fixture(autouse=True)
