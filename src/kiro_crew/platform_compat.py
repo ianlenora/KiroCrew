@@ -22,6 +22,7 @@ import ntpath
 import os
 import pathlib
 import platform
+import re
 import shutil
 import signal
 import site
@@ -2332,6 +2333,80 @@ def get_ppid(pid: int) -> int:
         except Exception:
             return -1
     return -1
+
+
+# Bounds the parent walk in is_exec_supervisor_of_this_process. Each in-app
+# restart through a supervising launcher nests one more supervisor above the
+# gateway, so the bound is generous; the walk normally ends at init long before.
+_ANCESTRY_MAX_DEPTH = 64
+
+# A Python interpreter's file name: python, python3, python3.12, python3.13t,
+# python.exe, and the macOS framework build's ``Python``.
+_PYTHON_INTERPRETER_NAME = re.compile(r"python(\d+(\.\d+)*)?[a-z]?(\.exe)?", re.IGNORECASE)
+
+
+def process_executable_path(pid: int) -> str | None:
+    """The executable *pid* is running now, or None when the host will not say.
+
+    Linux: ``/proc/<pid>/exe``. macOS: :func:`darwin_process_path`
+    (``proc_pidpath``). Windows and every failure: None. The path is the image
+    after the most recent exec, which is what tells a process that exec-ed into
+    a launcher apart from a Python program.
+    """
+    if type(pid) is not int or pid <= 0:
+        return None
+    try:
+        if sys.platform == "linux":
+            target = os.readlink(f"/proc/{pid}/exe")
+            return target.removesuffix(" (deleted)") or None
+        if sys.platform == "darwin":
+            return darwin_process_path(pid)
+    except Exception:
+        return None
+    return None
+
+
+def _is_python_interpreter_path(path: str) -> bool:
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    return _PYTHON_INTERPRETER_NAME.fullmatch(name) is not None
+
+
+def is_exec_supervisor_of_this_process(pid: int) -> bool:
+    """True when *pid* is a live ancestor whose image is not a Python interpreter.
+
+    An in-app restart ``os.execv``s the launcher, and a launcher that runs the
+    gateway as a supervised CHILD (``toolbox-exec``) leaves the old pid alive as
+    the new gateway's ancestor, start time unchanged. Ownership checks use this to
+    tell that supervisor -- this gateway's own previous image -- from another
+    gateway.
+
+    Ancestry alone is not that proof: a gateway started from a shell a LIVE
+    gateway spawned has that gateway as an ancestor too. What the exec changed is
+    the image, and every gateway image is a Python interpreter, so an ancestor
+    still running one is treated as a gateway. The same holds for every process
+    BETWEEN this one and *pid*: a live Python process there may be the gateway
+    *pid* supervises, which started this one, so the walk refuses as soon as it
+    passes one -- or one whose image it cannot read. False also for pid <= 1
+    (init is every process's ancestor), for an executable the host will not
+    report (Windows, an unreadable process), and when the parent walk fails --
+    each keeps the caller's pre-existing verdict.
+    """
+    current = os.getppid()
+    seen: set[int] = set()
+    for _ in range(_ANCESTRY_MAX_DEPTH):
+        # Checked before the match, so pid 1 (and lower) is never accepted.
+        if current <= 1 or current in seen:
+            return False
+        exe = process_executable_path(current)
+        if exe is None or _is_python_interpreter_path(exe):
+            # *pid* itself must be a non-Python image, and so must everything
+            # between: a Python process in between may be a live gateway.
+            return False
+        if current == pid:
+            return True
+        seen.add(current)
+        current = get_ppid(current)
+    return False
 
 
 # macOS ``struct proc_bsdinfo`` (PROC_PIDTBSDINFO, 136 bytes) field offsets used
