@@ -6813,7 +6813,14 @@
       "remote_sessions_not_shown_in_board_view_other": "{{count}} remote sessions are not shown in board view — board columns manage local sessions only.",
       "sessions_from_instance_unavailable": "Sessions from {{names}} are unavailable right now.",
       "checking_remote_instances": "Checking remote crews…",
-      "remote_instances_list_unavailable": "Remote crews could not be listed, so their sessions are not shown."
+      "remote_instances_list_unavailable": "Remote crews could not be listed, so their sessions are not shown.",
+      "clean_up_empty_folders": "Clean up empty folders",
+      "clean_up_empty_folders_menu": "Clean up empty folders…",
+      "empty_folders_explainer": "Deletes folders that hold no open session and no settings. Old sessions inside them stay in Older Sessions.",
+      "include_top_level_folders": "Include top-level folders",
+      "no_empty_folders": "No empty folders to delete.",
+      "some_folders_kept": "Some folders were kept: they are no longer empty.",
+      "deleting_folders": "Deleting…"
     },
     "contextBreakdown": {
       "axis_turn_n": "Turn {{n}}",

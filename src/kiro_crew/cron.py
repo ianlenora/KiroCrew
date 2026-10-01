@@ -2877,6 +2877,25 @@ class CronService:
             self._sync_for_write()
             return {owner for job in self._jobs if (owner := job.session_key)}
 
+    def _chat_folder_ids_locked(self) -> set[str]:
+        """Every non-empty ``chat_folder_id`` on disk, read under ONE lock. STRICT.
+
+        For the folder cleanup, which must not delete a folder a saved job files
+        its tab into: the job stores the folder's id, so a folder recreated by
+        name would not bring the filing back. Same failure contract as
+        :meth:`_owner_keys_locked` and for the same reason -- an unreadable or
+        contended store is an unknown job set, not an empty one, so this raises
+        :class:`CronStoreBusy` or :class:`CronStoreUnreadable` instead of
+        answering "no folders". Includes disabled and auto-paused jobs.
+        """
+        with self._file_lock():
+            self._sync_for_write()
+            return {fid for job in self._jobs if (fid := job.chat_folder_id)}
+
+    async def chat_folder_ids_async(self) -> set[str]:
+        """Event-loop-safe :meth:`_chat_folder_ids_locked`."""
+        return await asyncio.to_thread(self._chat_folder_ids_locked)
+
     async def owner_keys_async(self) -> set[str]:
         """Event-loop-safe :meth:`_owner_keys_locked` — the lock+read runs off the loop.
 

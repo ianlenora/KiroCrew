@@ -11611,7 +11611,20 @@
       "source_link_actions": "Einen PR- oder Issue-Chip ausblenden",
       "unlink_source_link": "Wähle einen PR- oder Issue-Chip, um ihn dauerhaft aus dieser Sitzung auszublenden. Quelle und Gesprächsverlauf bleiben unverändert.",
       "unlink_source_link_confirm": "Zum dauerhaften Ausblenden von „{{label}}“ erneut auswählen",
-      "unlink_source_link_failed": "Ausblenden fehlgeschlagen. Erneut versuchen."
+      "unlink_source_link_failed": "Ausblenden fehlgeschlagen. Erneut versuchen.",
+      "clean_up_empty_folders": "Leere Ordner aufräumen",
+      "clean_up_empty_folders_menu": "Leere Ordner aufräumen…",
+      "empty_folders_explainer": "Löscht Ordner ohne offene Sitzung und ohne Einstellungen. Alte Sitzungen darin bleiben in Ältere Sitzungen.",
+      "include_top_level_folders": "Ordner der obersten Ebene einbeziehen",
+      "no_empty_folders": "Keine leeren Ordner zum Löschen.",
+      "some_folders_kept": "Einige Ordner wurden behalten, weil sie nicht mehr leer sind.",
+      "delete_empty_folders_one": "{{count}} leeren Ordner löschen",
+      "delete_empty_folders_other": "{{count}} leere Ordner löschen",
+      "deleting_folders": "Wird gelöscht…",
+      "archived_sessions_kept_one": "{{count}} archivierte Sitzung bleibt in Ältere Sitzungen",
+      "archived_sessions_kept_other": "{{count}} archivierte Sitzungen bleiben in Ältere Sitzungen",
+      "archived_count_one": "{{count}} archiviert",
+      "archived_count_other": "{{count}} archiviert"
     },
     "connectionsPage": {
       "action_failed": "Aktion fehlgeschlagen: {{error}}",

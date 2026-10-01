@@ -11611,7 +11611,20 @@
       "source_link_actions": "कोई PR या Issue चिप छिपाओ",
       "unlink_source_link": "इस सत्र से स्थायी रूप से छिपाने के लिए कोई PR या Issue चिप चुनो। स्रोत और बातचीत का रिकॉर्ड अपरिवर्तित रहेंगे।",
       "unlink_source_link_confirm": "“{{label}}” को स्थायी रूप से छिपाने के लिए फिर से चुनो",
-      "unlink_source_link_failed": "छिपाया नहीं जा सका। पुनः प्रयास करो।"
+      "unlink_source_link_failed": "छिपाया नहीं जा सका। पुनः प्रयास करो।",
+      "clean_up_empty_folders": "खाली फ़ोल्डर साफ़ करो",
+      "clean_up_empty_folders_menu": "खाली फ़ोल्डर साफ़ करो…",
+      "empty_folders_explainer": "जिन फ़ोल्डरों में कोई खुला सत्र या सेटिंग नहीं है, उन्हें हटाता है। उनके पुराने सत्र पुराने सत्र में ही रहते हैं।",
+      "include_top_level_folders": "सबसे ऊपर के फ़ोल्डर भी शामिल करो",
+      "no_empty_folders": "हटाने के लिए कोई खाली फ़ोल्डर नहीं है।",
+      "some_folders_kept": "कुछ फ़ोल्डर रखे गए: वे अब खाली नहीं हैं।",
+      "delete_empty_folders_one": "{{count}} खाली फ़ोल्डर हटाओ",
+      "delete_empty_folders_other": "{{count}} खाली फ़ोल्डर हटाओ",
+      "deleting_folders": "हटाया जा रहा है…",
+      "archived_sessions_kept_one": "{{count}} आर्काइव किया गया सत्र पुराने सत्र में रहेगा",
+      "archived_sessions_kept_other": "{{count}} आर्काइव किए गए सत्र पुराने सत्र में रहेंगे",
+      "archived_count_one": "{{count}} आर्काइव किया गया",
+      "archived_count_other": "{{count}} आर्काइव किए गए"
     },
     "connectionsPage": {
       "action_failed": "कार्रवाई विफल: {{error}}",

@@ -11436,7 +11436,17 @@
       "source_link_actions": "PR または Issue チップを非表示",
       "unlink_source_link": "このセッションから完全に非表示にする PR または Issue チップを選択してください。ソースと会話履歴は変更されません。",
       "unlink_source_link_confirm": "もう一度選択して 「{{label}}」 を完全に非表示",
-      "unlink_source_link_failed": "非表示にできませんでした。もう一度お試しください。"
+      "unlink_source_link_failed": "非表示にできませんでした。もう一度お試しください。",
+      "clean_up_empty_folders": "空のフォルダーを整理",
+      "clean_up_empty_folders_menu": "空のフォルダーを整理…",
+      "empty_folders_explainer": "開いているセッションも設定もないフォルダーを削除します。中の古いセッションは「以前のセッション」に残ります。",
+      "include_top_level_folders": "最上位のフォルダーも含める",
+      "no_empty_folders": "削除できる空のフォルダーはありません。",
+      "some_folders_kept": "一部のフォルダーは残しました。空ではなくなったためです。",
+      "delete_empty_folders_other": "空のフォルダー {{count}} 件を削除",
+      "deleting_folders": "削除中…",
+      "archived_sessions_kept_other": "アーカイブ済みのセッション {{count}} 件は「以前のセッション」に残ります",
+      "archived_count_other": "アーカイブ済み {{count}} 件"
     },
     "connectionsPage": {
       "action_failed": "操作に失敗しました: {{error}}",

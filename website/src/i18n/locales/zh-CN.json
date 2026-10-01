@@ -11436,7 +11436,17 @@
       "source_link_actions": "隐藏 PR 或 Issue 标签",
       "unlink_source_link": "选择要从此会话永久隐藏的 PR 或 Issue 标签。源内容和对话记录保持不变。",
       "unlink_source_link_confirm": "再次选择以永久隐藏 “{{label}}”",
-      "unlink_source_link_failed": "无法隐藏，请重试。"
+      "unlink_source_link_failed": "无法隐藏，请重试。",
+      "clean_up_empty_folders": "清理空文件夹",
+      "clean_up_empty_folders_menu": "清理空文件夹…",
+      "empty_folders_explainer": "删除没有打开的会话、也没有设置的文件夹。里面的旧会话仍保留在“较早的会话”中。",
+      "include_top_level_folders": "包含顶层文件夹",
+      "no_empty_folders": "没有可删除的空文件夹。",
+      "some_folders_kept": "部分文件夹已保留：它们已不再为空。",
+      "delete_empty_folders_other": "删除 {{count}} 个空文件夹",
+      "deleting_folders": "正在删除…",
+      "archived_sessions_kept_other": "{{count}} 个已归档会话保留在“较早的会话”中",
+      "archived_count_other": "已归档 {{count}} 个"
     },
     "connectionsPage": {
       "action_failed": "操作失败：{{error}}",

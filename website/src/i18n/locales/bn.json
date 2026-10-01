@@ -11611,7 +11611,20 @@
       "source_link_actions": "একটি PR বা Issue চিপ লুকাও",
       "unlink_source_link": "এই সেশন থেকে স্থায়ীভাবে লুকাতে একটি PR বা Issue চিপ নির্বাচন করো। উৎস ও কথোপকথনের রেকর্ড অপরিবর্তিত থাকবে।",
       "unlink_source_link_confirm": "“{{label}}” স্থায়ীভাবে লুকাতে আবার নির্বাচন করো",
-      "unlink_source_link_failed": "লুকানো যায়নি। আবার চেষ্টা করো।"
+      "unlink_source_link_failed": "লুকানো যায়নি। আবার চেষ্টা করো।",
+      "clean_up_empty_folders": "খালি ফোল্ডার পরিষ্কার করো",
+      "clean_up_empty_folders_menu": "খালি ফোল্ডার পরিষ্কার করো…",
+      "empty_folders_explainer": "যে ফোল্ডারে কোনো খোলা সেশন বা সেটিং নেই, সেগুলো মুছে দেয়। ভেতরের পুরোনো সেশন পুরোনো সেশনেই থাকে।",
+      "include_top_level_folders": "শীর্ষ স্তরের ফোল্ডারও অন্তর্ভুক্ত করো",
+      "no_empty_folders": "মোছার মতো কোনো খালি ফোল্ডার নেই।",
+      "some_folders_kept": "কিছু ফোল্ডার রাখা হয়েছে: সেগুলো আর খালি নেই।",
+      "delete_empty_folders_one": "{{count}}টি খালি ফোল্ডার মুছে ফেলো",
+      "delete_empty_folders_other": "{{count}}টি খালি ফোল্ডার মুছে ফেলো",
+      "deleting_folders": "মুছে ফেলা হচ্ছে…",
+      "archived_sessions_kept_one": "{{count}}টি আর্কাইভ করা সেশন পুরোনো সেশনে থাকবে",
+      "archived_sessions_kept_other": "{{count}}টি আর্কাইভ করা সেশন পুরোনো সেশনে থাকবে",
+      "archived_count_one": "{{count}}টি আর্কাইভ করা",
+      "archived_count_other": "{{count}}টি আর্কাইভ করা"
     },
     "connectionsPage": {
       "action_failed": "অ্যাকশন ব্যর্থ: {{error}}",
