@@ -8943,7 +8943,6 @@
       "autopilot": "Автопилот",
       "incognito": "Инкогнито",
       "incognito_desc": "Использует существующую память, но не усваивает новых уроков. Сохраняет историю чата для восстановления вкладки.",
-      "refresh_suggestions": "Обновить подсказки",
       "simple_tasks_run_instantly_complex_ones_get_a_pl": "Простые задачи выполняются сразу. Для сложных сначала составляется план, который вы утверждаете.",
       "suggestion_pipeline_status": "Проверить статус моего пайплайна",
       "suggestion_review_cr": "Проверить мой последний CR",
@@ -8965,7 +8964,8 @@
       "greeting_good_to_see_you": "Рад тебя видеть. Что дальше?",
       "greeting_good_morning": "Доброе утро. С чего начнём?",
       "greeting_good_afternoon": "Добрый день. С чего начнём?",
-      "greeting_good_evening": "Добрый вечер. С чего начнём?"
+      "greeting_good_evening": "Добрый вечер. С чего начнём?",
+      "suggestions_failed_to_load": "Не удалось загрузить подсказки"
     },
     "widgetFrame": {
       "cannot_star_widget_has_no_slug_or_message_contex": "Нельзя добавить в избранное: у виджета нет slug или контекста сообщения",

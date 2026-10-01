@@ -5532,7 +5532,6 @@
       "web_preview": "Web preview"
     },
     "welcomeView": {
-      "refresh_suggestions": "Refresh suggestions",
       "simple_tasks_run_instantly_complex_ones_get_a_pl": "Simple tasks run instantly. Complex ones get a plan you approve first.",
       "try_create_a_plan_to_analyze_kirocrew_code_packa": "Try: “Create a plan to analyze {{productName}} code package and report file count by major components”"
     },

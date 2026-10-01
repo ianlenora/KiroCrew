@@ -1,13 +1,15 @@
 import { useState } from 'react'
 import {
-  Activity, Clock, Code2, Eye, FileText, ListChecks, RefreshCw, Search, Sparkles, type LucideIcon,
+  Activity, Clock, Code2, Eye, FileText, ListChecks, Search, Sparkles, type LucideIcon,
 } from 'lucide-react'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
+import ErrorNotice from './ErrorNotice'
 import { KiroGhost } from './KiroGhost'
 import { MemoryModeChip, type MemoryMode } from './MemoryModeChip'
 import { useTheme } from '../hooks/useTheme'
 import { getThemeBranding } from '../themeBranding'
 import { api, type SuggestionItem, type SuggestionKind } from '../api/client'
+import { reportForError } from '../utils/errorReport'
 
 import { i18nT } from '../i18n/t'
 interface WelcomeViewProps {
@@ -61,9 +63,7 @@ export function welcomeGreetings(): string[] {
 }
 
 function SuggestedCards({ setInput }: { setInput: (v: string) => void }) {
-  const qc = useQueryClient()
-  const [refreshing, setRefreshing] = useState(false)
-  const { data, isFetching } = useQuery({
+  const { data, isError, error } = useQuery({
     queryKey: ['suggestions'],
     queryFn: () => api.suggestions(),
     staleTime: 5 * 60_000,
@@ -83,25 +83,30 @@ function SuggestedCards({ setInput }: { setInput: (v: string) => void }) {
   ]
   const cards = data?.suggestions?.length ? data.suggestions.map(normalizeSuggestion) : fallbackSuggestions
 
-  const handleRefresh = async () => {
-    setRefreshing(true)
-    try {
-      const fresh = await api.suggestions(true)
-      qc.setQueryData(['suggestions'], fresh)
-    } catch {}
-    setRefreshing(false)
-  }
-
-  const spinning = isFetching || refreshing
-
   return (
     <div className="w-full max-w-[620px] mx-auto">
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+      {/* A failed fetch still shows the built-in cards below, but says so: the
+          welcome screen holds no unsaved state, so the agent hand-off is on. The
+          message is the localized line, not the transport error -- "Failed to
+          fetch" is jargon on the product's first screen -- so the structured
+          report (endpoint, status, code) rides along explicitly for the hand-off. */}
+      {isError && (
+        <ErrorNotice
+          message={i18nT('components.welcomeView.suggestions_failed_to_load')}
+          report={reportForError(error)}
+          variant="inline"
+          askAgent
+          className="mb-3"
+        />
+      )}
+      {/* Phones: a tight list of bare rows. sm+: a 3-column card grid. */}
+      <div className="grid grid-cols-1 gap-0.5 sm:grid-cols-3 sm:gap-3">
         {cards.map(({ text, kind }, i) => {
           const { Icon, tile } = SUGGESTION_KIND_STYLE[kind]
           return (
-            // Phones: a compact one-line row. sm+: fixed-height cell with the card absolute
-            // inside it, so on hover/focus it grows DOWN over the next row instead of reflowing.
+            // Phones: a compact one-line row with no box around it, so six of them stack
+            // tightly. sm+: fixed-height cell with the card absolute inside it, so on
+            // hover/focus it grows DOWN over the next row instead of reflowing.
             <div key={`${i}-${text}`} className="relative sm:h-[108px] hover:z-10 focus-within:z-10">
               {/* type=button + onMouseDown preventDefault stop the card from taking
                   keyboard focus on click. Without this the focused card is re-activated
@@ -112,9 +117,9 @@ function SuggestedCards({ setInput }: { setInput: (v: string) => void }) {
                 data-kind={kind}
                 onMouseDown={e => e.preventDefault()}
                 onClick={() => setInput(text)}
-                className="group relative w-full sm:absolute sm:top-0 sm:inset-x-0 sm:min-h-full flex flex-row sm:flex-col items-center sm:items-start gap-3 px-4 py-3 sm:gap-2.5 sm:p-3.5 rounded-xl border border-border bg-card text-card-fg text-[13px] font-medium text-left overflow-hidden cursor-pointer transition-[border-color,box-shadow] duration-200 hover:border-accent hover:shadow-lg focus-visible:border-accent focus-visible:shadow-lg"
+                className="group relative w-full sm:absolute sm:top-0 sm:inset-x-0 sm:min-h-full flex flex-row sm:flex-col items-center sm:items-start gap-2.5 px-2 py-1.5 sm:gap-2.5 sm:p-3.5 rounded-lg sm:rounded-xl border border-transparent sm:border-border bg-transparent sm:bg-card text-text sm:text-card-fg text-[13px] font-medium text-left overflow-hidden cursor-pointer transition-[border-color,box-shadow,background-color] duration-200 hover:bg-bg-hover sm:hover:bg-card sm:hover:border-accent sm:hover:shadow-lg focus-visible:bg-bg-hover sm:focus-visible:bg-card sm:focus-visible:border-accent sm:focus-visible:shadow-lg"
               >
-                <span aria-hidden="true" className={`w-8 h-8 shrink-0 rounded-lg flex items-center justify-center ${tile}`}>
+                <span aria-hidden="true" className={`w-7 h-7 sm:w-8 sm:h-8 shrink-0 rounded-lg flex items-center justify-center ${tile}`}>
                   <Icon size={16} />
                 </span>
                 <span className="min-w-0 leading-[1.35] truncate sm:whitespace-normal sm:line-clamp-2 sm:group-hover:line-clamp-none sm:group-focus-visible:line-clamp-none">{text}</span>
@@ -122,18 +127,6 @@ function SuggestedCards({ setInput }: { setInput: (v: string) => void }) {
             </div>
           )
         })}
-      </div>
-      {/* z-20 keeps the link above a hovered bottom-row card (z-10) growing over it. */}
-      <div className="relative z-20 flex justify-end mt-4">
-        <button
-          type="button"
-          onClick={handleRefresh}
-          disabled={spinning}
-          className="inline-flex items-center gap-1.5 rounded-lg px-2 py-1 text-[12px] text-muted hover:text-text hover:bg-bg-hover bg-transparent transition-colors cursor-pointer disabled:cursor-default"
-        >
-          <RefreshCw size={12} className={spinning ? 'animate-spin' : ''} />
-          <span>{i18nT('components.welcomeView.refresh_suggestions')}</span>
-        </button>
       </div>
     </div>
   )
