@@ -2822,6 +2822,7 @@ export default function App() {
   const [changelogDecided, setChangelogDecided] = useState(false)
   const [autoUpdate, setAutoUpdate] = useState(true)
   const [autoUpdateError, setAutoUpdateError] = useState('')
+  const autoUpdateTouched = useRef(false)
   const [fullChangelog, setFullChangelog] = useState('')
   const [showFull, setShowFull] = useState(false)
   const [devMode, setDevMode] = useState(() => localStorage.getItem('mc-dev-mode') === '1')
@@ -3090,6 +3091,21 @@ export default function App() {
     queryFn: () => api.kirocrewConfig(),
   })
   const { data: kirocrewCfg, isSuccess: kirocrewCfgLoaded } = kirocrewCfgQuery
+  // The update modal's toggle starts at a guess (`true`), so each time the modal
+  // opens it reads the saved `auto_update` fresh. A click made while that read
+  // is in flight wins over it, and only a read that succeeded is applied.
+  const refetchKirocrewCfg = kirocrewCfgQuery.refetch
+  useEffect(() => {
+    if (!showChangelog) return
+    let live = true
+    autoUpdateTouched.current = false
+    void refetchKirocrewCfg().then(r => {
+      if (!live || autoUpdateTouched.current) return
+      const saved = (r.data as { auto_update?: unknown } | undefined)?.auto_update
+      if (r.isSuccess && typeof saved === 'boolean') setAutoUpdate(saved)
+    })
+    return () => { live = false }
+  }, [showChangelog, refetchKirocrewCfg])
   const kiroCreditSurface = isKiroBackend(kirocrewCfg)
   // "The config read failed" must survive its own retry: a data-less errored
   // query goes back to `pending` (error cleared) for the whole refetch, and
@@ -4782,7 +4798,7 @@ export default function App() {
               <div className="flex items-center justify-between mt-4 pt-3 border-t border-border">
                 <span className="text-[13px] text-muted">{i18nT('app.auto_update_on_restart')}</span>
                 <Toggle checked={autoUpdate} label={i18nT('app.auto_update_on_restart')}
-                  onChange={async next => { setAutoUpdate(next); setAutoUpdateError(''); try { await api.setAutoUpdate(next) } catch (e) { setAutoUpdate(!next); setAutoUpdateError(String(e instanceof Error ? e.message : e)) } }} />
+                  onChange={async next => { autoUpdateTouched.current = true; setAutoUpdate(next); setAutoUpdateError(''); try { await api.setAutoUpdate(next) } catch (e) { autoUpdateTouched.current = false; setAutoUpdate(!next); setAutoUpdateError(String(e instanceof Error ? e.message : e)) } }} />
               </div>
             )}
             {autoUpdateError && <ErrorNotice className="mt-3" askAgent title={i18nT('pages.overview.agentCfgTab.save_failed')} message={autoUpdateError} onHandoff={() => setShowChangelog(false)} />}
