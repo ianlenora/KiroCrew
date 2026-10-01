@@ -2204,12 +2204,14 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
             print(f"Paused job: {args.job_id}")
         else:
             print(f"Job not found: {args.job_id}")
+            sys.exit(1)
 
     elif action == "resume":
         if svc.enable_job(args.job_id, enabled=True):
             print(f"Resumed job: {args.job_id}")
         else:
             print(f"Job not found: {args.job_id}")
+            sys.exit(1)
 
     elif action == "trigger":
         # Instance-aware, for the same reason as the MCP trigger: DASHBOARD_PORT reads
@@ -2226,6 +2228,8 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
             source="cli",
             resources=f"job_id={args.job_id}",
         )
+        if not ok:
+            sys.exit(1)
 
     elif action == "preview":
         _cron_preview(args)
