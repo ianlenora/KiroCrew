@@ -1317,6 +1317,21 @@ class TestTheComposition:
         for gone in ("_quarantined", "_load_refused", "_unparsed_rows", "_stop_notes"):
             assert not hasattr(svc, gone), gone
 
+    def test_the_loader_reads_the_path_the_store_holds_now(self, tmp_path: Path) -> None:
+        """The service's ``_path`` is read off the composed store on each access, so the
+        loader reads the file the store writes, not a copy taken at construction."""
+        svc = AutoNudgeService(base_dir=tmp_path / "first")
+        moved = tmp_path / "second" / svc._store.path.name
+        moved.parent.mkdir()
+        # A non-object root, which the loader refuses: proof of which file it read.
+        moved.write_text("[]", encoding="utf-8")
+        svc._store.path = moved
+        assert svc._path == moved
+        svc._load()
+        assert svc._store.load_refused is True
+        with pytest.raises(AttributeError):
+            svc._path = tmp_path / "elsewhere"  # type: ignore[misc]
+
 
 class TestTheOwnersReadTheSeamsThroughTheFacade:
     def test_no_owner_imports_the_facade_or_a_later_owner_at_import_time(self) -> None:

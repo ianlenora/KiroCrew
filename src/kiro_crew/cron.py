@@ -26,11 +26,13 @@ run lifecycle, the reaper and ``cancel()`` teardown, and every store transaction
 
 This module is also the subsystem's import and patch surface: every function,
 class and constant it defined before those owners moved out still resolves here
-as the same object.
+as the same object, and so does every public name it imported from the rest of
+the package.
 The names tests patch here that moved code reads -- ``datetime``,
 ``get_local_tz``, ``published_config_timezone``, ``cron_expr_matches``,
 ``config_dir``, ``_record_is_enabled``, ``sel`` and ``_JOB_TIMEOUT_SECS`` -- the
-owners read through this module on each call, so a patch here reaches them.
+owners read through this module on each call, so a patch here reaches them. Every
+other name the owners read is their own global, which a patch here does not reach.
 """
 
 from __future__ import annotations
@@ -56,6 +58,7 @@ from typing import (
 if TYPE_CHECKING:
     from kiro_crew.session import SessionManager
 
+from kiro_crew import platform_compat  # noqa: F401 -- re-exported
 from kiro_crew import (
     cron_inflight,
     cron_script,
@@ -165,6 +168,7 @@ from kiro_crew.cron_service.store import (  # noqa: F401 -- re-exported
     encode_store,
     store_digest,
 )
+from kiro_crew.executors import cron_gate_budget  # noqa: F401 -- re-exported
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.metrics.events import CRON_FIRES, emit_counter
 from kiro_crew.process_identity import (
@@ -186,6 +190,11 @@ from kiro_crew.process_identity import (
 )
 from kiro_crew.resource_status import admission_check
 from kiro_crew.runtime_ownership import authorize_runtime_kill
+from kiro_crew.validation import (  # noqa: F401 -- re-exported
+    CHANNEL_MAX_LEN,
+    MAX_CRON_MESSAGE,
+    MAX_SHORT_STRING,
+)
 
 logger = logging.getLogger(__name__)
 

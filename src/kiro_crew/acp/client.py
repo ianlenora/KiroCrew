@@ -13674,9 +13674,10 @@ class AcpClient:
 #   ``kiro_crew.acp.client.<name>`` reaches the owner's own callers. A forwarded name
 #   is absent from this module's namespace on purpose -- a binding here would
 #   shadow the owner for every later read -- and this module's code reads it as
-#   ``<owner>.<name>``. An import only moved code reads, and that a test reads or
-#   patches through this module, is forwarded to the owner that reads it, for the
-#   same reason; an import nothing reaches through this module is not re-exported.
+#   ``<owner>.<name>``. A public package import only moved code reads is forwarded to
+#   the owner that reads it, for the same reason, so a test that reads or patches it
+#   through this module reaches that reader; a standard-library or typing import only
+#   moved code reads is not re-exported.
 # * The modules the moved process-tree helpers probe with (``platform_compat``,
 #   ``sys``, ``Path``, ``subprocess_mod``) stay bound here. Each helper listed in the
 #   facade test's ``_SEAM_IMPORTS`` imports them from this module when it runs, so a
@@ -13758,6 +13759,12 @@ _EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
         "_rejected_model_from_error",
         "corroborate_launcher_refusal",
         "is_credential_propagation_delay",
+        "ACP_BACKENDS_HOST_AUTH_CALLBACK",
+        "LAUNCHER_EXIT_PREFIXES",
+        "SANDBOX_LAYER_CREW",
+        "SANDBOX_LAYER_HARNESS",
+        "launcher_refusal",
+        "sandbox_init_remediation",
     ),
     "kiro_crew.acp.runtime_models": (
         "advertised_model_ids",
@@ -13904,6 +13911,8 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         _RE_THROTTLE_NAMED,
         _RE_TRAILING_REQ_ID,
         _RE_USAGE_LIMIT,
+        ACP_BACKENDS_HOST_AUTH_CALLBACK,
+        LAUNCHER_EXIT_PREFIXES,
         PROVIDER_ERROR_AUTH,
         PROVIDER_ERROR_CONNECTION,
         PROVIDER_ERROR_CREDENTIAL_PROPAGATION,
@@ -13914,6 +13923,8 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         PROVIDER_ERROR_THROTTLE,
         PROVIDER_ERROR_UNKNOWN,
         PROVIDER_ERROR_USAGE_LIMIT,
+        SANDBOX_LAYER_CREW,
+        SANDBOX_LAYER_HARNESS,
         AcpPermissionNeeded,
         AcpPromptBusy,
         AcpRegistrationRateLimited,
@@ -13931,7 +13942,9 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         is_auth_failure_output,
         is_credential_propagation_delay,
         is_registration_throttle_output,
+        launcher_refusal,
         sandbox_init_failure_for_runtime,
+        sandbox_init_remediation,
     )
     from kiro_crew.acp.transport_framing import (  # noqa: F401
         _OVERSIZE_DRAIN_MAX_BYTES,

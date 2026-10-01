@@ -36,11 +36,13 @@ in one table at the end of its body.
 
 This module is also the subsystem's import and patch surface: every name it defined
 before those owners moved out still resolves here as the same object its owner holds,
-and so does every imported name callers and tests read off it. The names moved code
-reads through this module on each call -- so a patch here reaches it -- are
+and so does every public name it imported from the rest of the package and every
+other import callers and tests read off it. The names moved code reads through this
+module on each call -- so a patch here reaches it -- are
 ``_OVERDUE_REARM_SECS``, ``_RECONCILE_INTERVAL_SECS``, ``replace_with_retry``,
 ``fsync_dir``, ``scrubbed_judge_spec``, ``_INSTANCE``, ``_MAINTENANCE_LOCKS`` and
-``_MUTATION_LOCK_OWNERS``.
+``_MUTATION_LOCK_OWNERS``. Every other name the owners read is their own global, which
+a patch here does not reach.
 """
 
 from __future__ import annotations
@@ -56,6 +58,9 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from kiro_crew import irq  # noqa: F401 -- read off this module by callers and tests
+from kiro_crew import platform_compat  # noqa: F401 -- re-exported
+from kiro_crew import probes  # noqa: F401 -- re-exported
+from kiro_crew import shutdown_event  # noqa: F401 -- re-exported
 from kiro_crew import autonudge_stop_log, validation
 from kiro_crew.atomic_write import (  # noqa: F401 -- read off this module by callers and tests
     fsync_dir,
@@ -143,21 +148,52 @@ from kiro_crew.autonudge_service.timers import (  # noqa: F401 -- re-exported
     _current_task_or_none,
     _resolve_beat,
 )
+from kiro_crew.config.loader import data_home  # noqa: F401 -- re-exported
 from kiro_crew.config.loader import config_dir
 from kiro_crew.config.paths import legacy_home
 from kiro_crew.constants import MAX_BANNER_CHARS
-from kiro_crew.monitoring.models import (  # noqa: F401 -- MonitorState: read off this module
+from kiro_crew.monitoring.decision import (  # noqa: F401 -- re-exported
+    decide_monitor,
+    monitor_budget_reason,
+    monitor_stall_reason,
+    stamp_monitor_alerted,
+)
+from kiro_crew.monitoring.github_provider_errors import (  # noqa: F401 -- re-exported
+    is_unattempted_probe,
+)
+from kiro_crew.monitoring.limits import validate_runtime_secs  # noqa: F401 -- re-exported
+from kiro_crew.monitoring.models import (  # noqa: F401 -- re-exported
+    MONITOR_BUSY_RETRY_SECS,
+    MONITOR_COMPLETION_EVIDENCE_TIMEOUT_SECS,
     MONITOR_STATE_VERSION,
+    MONITOR_STOP_APPROVAL_STALL,
     MONITOR_STOP_COMPLETION_UNAVAILABLE,
+    MONITOR_STOP_SESSION_CLOSE,
     MONITOR_STOP_SESSION_UNAVAILABLE,
     MONITOR_STOP_UNSUPPORTED_VERSION,
+    MONITOR_STOP_USER,
+    MonitorActionCompletion,
+    MonitorActionDisposition,
+    MonitorBudgets,
+    MonitorCreationSurface,
+    MonitorDecision,
     MonitorDispatchResult,
+    MonitorObservationStatus,
     MonitorOutcome,
+    MonitorProbeResult,
     MonitorState,
+    MonitorVerdict,
     monitor_state_from_dict,
+    monitor_state_to_dict,
     quarantine_monitor_state,
+    retained_outcome_blocks_rearm,
+)
+from kiro_crew.monitoring.registry import (  # noqa: F401 -- re-exported
+    REVIEW_READY,
+    kind_supports_objective,
 )
 from kiro_crew.platform import PlatformCompositionError, redact_log_via_context, redact_via_context
+from kiro_crew.probes import targets  # noqa: F401 -- re-exported
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
@@ -197,7 +233,7 @@ def _bounded_judge_spec(raw: object, loop_id: object = None) -> dict:
         # own -- an opted-out loop has no criteria to carry, so pairing the marker with
         # a brief would describe a state no arming call can produce.
         return {validation.JUDGE_OFF_KEY: True}
-    targets = raw.get("targets")
+    targets = raw.get("targets")  # noqa: F811 -- a local, not the probes.targets module
     if isinstance(targets, (list, tuple)):
         clean = [t for t in targets if isinstance(t, str) and t.strip()][:_JUDGE_MAX_TARGETS]
         if clean:
@@ -235,7 +271,7 @@ def scrubbed_judge_spec(spec: dict) -> dict:
         value = out.get(key)
         if isinstance(value, str) and value:
             out[key] = scrub_loop_text(value)[:_JUDGE_MAX_CRITERION_CHARS]
-    targets = out.get("targets")
+    targets = out.get("targets")  # noqa: F811 -- a local, not the probes.targets module
     if isinstance(targets, (list, tuple)):
         out["targets"] = [
             (scrub_loop_text(t)[:_JUDGE_MAX_TARGET_CHARS] if isinstance(t, str) and t else t)
@@ -700,10 +736,8 @@ class AutoNudgeService:
         emit_judge_notice: Callable[[NudgeLoop, str], Awaitable[None]] | None = None,
     ) -> None:
         self._base_dir = base_dir or config_dir()
-        # The durable store's state and file protocol (see autonudge_service.store). The
-        # store file's path is kept here too: callers and tests read it off the service.
+        # The durable store's state and file protocol (see autonudge_service.store).
         self._store = LoopStore(self._base_dir)
-        self._path = self._store.path
         self._on_fire = on_fire
         self._on_monitor_tick = on_monitor_tick
         #: Reads the wake judge's evidence for one loop. Injected rather than called
@@ -790,6 +824,16 @@ class AutoNudgeService:
         self._reconcile_candidates: set[str] = set()
         self._observers: list[Callable[[str, NudgeLoop | None], None]] = []
         self._lock = asyncio.Lock()
+
+    @property
+    def _path(self) -> Path:
+        """The store file's path, which callers and tests read off the service.
+
+        Read from the composed store on every access rather than copied at
+        construction, so the loader reads the file the store writes even after
+        the store's path is reassigned.
+        """
+        return self._store.path
 
     # ── Persistence ──
 
