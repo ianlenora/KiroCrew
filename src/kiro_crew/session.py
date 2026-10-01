@@ -869,6 +869,42 @@ def _provider_has_active_turn(provider: LLMProvider) -> bool:
     return res is True
 
 
+def _provider_background_launch(provider: LLMProvider) -> tuple[float, str] | None:
+    """``provider``'s newest background launch as ``(seconds since, description)``.
+
+    ``None`` unless the provider answers with exactly that shape. Same defensive
+    shape as :func:`_provider_has_active_turn`: the probe is optional, a raising
+    one reads as "nothing launched", and an ``AsyncMock``-style double's
+    coroutine is closed. A ``MagicMock`` attribute answers a ``MagicMock``,
+    which is not a tuple, so a double can never hold the watchdog off.
+    """
+    fn = getattr(provider, "background_launch", None)
+    if not callable(fn):
+        return None
+    try:
+        res = fn()
+    except Exception:
+        return None
+    if inspect.isawaitable(res):
+        close = getattr(res, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        return None
+    if not (isinstance(res, tuple) and len(res) == 2):
+        return None
+    age, description = res
+    if (
+        isinstance(age, bool)
+        or not isinstance(age, (int, float))
+        or not isinstance(description, str)
+    ):
+        return None
+    return float(age), description
+
+
 def _context_pct_is_unknown(provider: LLMProvider) -> bool:
     """True only if ``provider`` reports its 0% context reading as unknown.
 
@@ -1357,6 +1393,7 @@ class SessionManager:
             provider_has_active_turn=lambda provider: _provider_has_active_turn(provider),
             emit_counter=lambda event, dimensions: emit_counter(event, dimensions),
             get_persistent_keys=lambda: _PERSISTENT_KEYS,
+            provider_background_launch=lambda provider: _provider_background_launch(provider),
             get_channel_prefix=lambda: _CHANNEL_PREFIX,
             get_stuck_turn_report_secs=lambda: _STUCK_TURN_REPORT_SECS,
             get_pycache_gc_interval_secs=lambda: PYCACHE_GC_INTERVAL_SECS,
