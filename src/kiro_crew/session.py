@@ -1316,6 +1316,10 @@ class SessionManager:
             self.__dict__["_cleanup_state"] = state
         return state
 
+    def runtime_reconciler(self) -> Any:
+        """The retained runtime reconciler, or ``None`` before the first cleanup tick."""
+        return self._cleanup_state_boundary().runtime_reconciler
+
     def _cleanup_deps(self) -> CleanupDeps:
         # Resolved HERE, on the thread that builds the deps, and carried into the
         # sandbox sweep. That sweep runs on the maintenance pool, and a path a pool

@@ -26,6 +26,11 @@ KIROCREW_SPAWNED_VALUE = "1"
 # this one says WHICH spawn, so a teardown that has lost its root can still tell
 # the root's own tree from a fresh spawn that took the root's recycled pid.
 KIROCREW_SPAWN_INSTANCE_ENV = "KIROCREW_SPAWN_INSTANCE"
+# The data home of the gateway that spawned an agent runtime, set beside the
+# instance and inherited the same way. KIROCREW_SPAWNED is install-agnostic, so
+# this is what tells this install's runtime from a sibling install's on the same
+# uid. Read only to WITHHOLD a kill: absent or different means not ours.
+KIROCREW_SPAWN_HOME_ENV = "KIROCREW_SPAWN_HOME"
 # Set on every tree spawned through ``sandbox.sandboxed_spawn_argv`` -- a build, an
 # ``npx`` install, a ``git``/``gh`` read, a provisioning run -- and inherited by that
 # whole tree exactly as KIROCREW_SPAWNED is. It says what KIROCREW_SPAWNED does not:

@@ -157,8 +157,9 @@ from kiro_crew.agent_sdk.tool_search import (
 from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
 from kiro_crew.browser_cli.launch import browser_session_env, browser_socket_env
 from kiro_crew.config import live
-from kiro_crew.config.paths import kiro_agents_dir
+from kiro_crew.config.paths import data_home, kiro_agents_dir
 from kiro_crew.constants import (
+    KIROCREW_SPAWN_HOME_ENV,
     KIROCREW_SPAWN_INSTANCE_ENV,
     KIROCREW_SPAWNED_ENV,
     KIROCREW_SPAWNED_VALUE,
@@ -2147,6 +2148,10 @@ class AcpRuntime:
         # /proc/<pid>/environ to prove a process is THIS spawn's descendant once
         # the root itself is gone.
         env[KIROCREW_SPAWN_INSTANCE_ENV] = spawn_instance
+        # Which install spawned it: the leaked-runtime reclaim refuses a runtime
+        # whose home is absent or differs, since the marker above is shared by
+        # every install on this uid.
+        env[KIROCREW_SPAWN_HOME_ENV] = str(data_home())
         # Own browser session per agent process, matching AcpClient._spawn (see
         # browser_session_env). Per PROCESS, not per agent: with session sharing
         # on (the default) an eligible subagent's session is created on the
