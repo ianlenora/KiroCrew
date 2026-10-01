@@ -2121,9 +2121,10 @@ def build_agent_config(*, gated_off: "frozenset[str] | None" = None) -> dict:
     # ``_load_existing_config`` path takes entries from an on-disk spec that
     # never comes through here; for that caller this filter is idempotent (the
     # predicate is pure, so filtering twice equals filtering once). A caller
-    # that replaces ``allowedTools`` wholesale (``_install_conductor_agent``)
-    # is unaffected. The SEL audit inside is best-effort and never raises, so
-    # the purity note above still holds for config/managed-state.
+    # that builds its own ``allowedTools`` from a grant tuple plus the entries on
+    # its installed spec (``conductor_agents._governed_grants``) is unaffected:
+    # it filters that list itself. The SEL audit inside is best-effort and never
+    # raises, so the purity note above still holds for config/managed-state.
     auto_approve._apply_allowed_tools_ceiling(config, source="build_agent_config")
     return config
 
@@ -3147,33 +3148,37 @@ def reproject_for_ceiling_change() -> None:
         return
     _path, wrote = rebuild_agent_config_reporting()
     if not wrote:
-        # The shared specs are not this instance's to rewrite, so the moved
-        # ceiling CANNOT be projected from here — and the memo must say so.
-        # The refusal verdict comes from the SAME evaluation that gated the
-        # write, inside the rebuild itself: probing the guard first and then
-        # rebuilding leaves a window where a concurrent default-home boot
-        # rewrites the specs between the two reads, the rebuild refuses, and
-        # a memo advanced on the stale probe marks the generation
-        # synchronised while the on-disk ``allowedTools`` were never narrowed
-        # — silently auto-approving tools the ceiling now forbids (the
-        # harness short-circuits them before PreToolUse). Leaving the memo
-        # behind keeps the advance-only-after-success rule literal for
-        # refusals: every later poll retries, and the pending generation is
-        # projected the moment the refusal clears instead of being lost for
-        # the process lifetime.
+        # Either the shared specs are not this instance's to rewrite, or a
+        # conductor spec on disk could not be read and was left unwritten
+        # (``conductor_agents._governed_grants``) -- in both cases the moved
+        # ceiling was NOT projected onto every ``allowedTools`` list on disk,
+        # and the memo must say so. The refusal verdict comes from the SAME
+        # evaluation that gated the write, inside the rebuild itself: probing
+        # the guard first and then rebuilding leaves a window where a
+        # concurrent default-home boot rewrites the specs between the two
+        # reads, the rebuild refuses, and a memo advanced on the stale probe
+        # marks the generation synchronised while the on-disk ``allowedTools``
+        # were never narrowed -- silently auto-approving tools the ceiling now
+        # forbids (the harness short-circuits them before PreToolUse). Leaving
+        # the memo behind keeps the advance-only-after-success rule literal
+        # for refusals: every later poll retries, and the pending generation
+        # is projected the moment the refusal clears instead of being lost
+        # for the process lifetime.
         #
         # The pending state is the security-relevant half of the refusal, so
-        # it logs at WARNING — the same tier as the decline itself — but once
+        # it logs at WARNING -- the same tier as the decline itself -- but once
         # per generation rather than per confirming poll, which fires every
         # refresh interval. The decline arm's own refusal warning and SEL
-        # event fire per attempt, which is the audit posture every other
-        # caller of the rebuild already has.
+        # event, and the installer's warning naming the spec it left alone,
+        # fire per attempt, which is the audit posture every other caller of
+        # the rebuild already has.
         global _pending_projection_warned_generation
         if _pending_projection_warned_generation != generation:
             _pending_projection_warned_generation = generation
             logger.warning(
                 "ceiling generation %s is pending: this instance may not rewrite "
-                "the shared agent home, so its on-disk auto-approvals still "
+                "the shared agent home, or a conductor spec on disk could not be "
+                "read and was left unchanged, so on-disk auto-approvals still "
                 "reflect the previous ceiling until the owning instance projects "
                 "the new one (or this instance's refusal clears)",
                 generation,
@@ -3216,14 +3221,21 @@ def rebuild_agent_config(
     the private *_wrote_out* out-parameter — the verdict comes from the SAME
     single evaluation of :func:`_decline_shared_agent_home` that gates the
     write below, never from a separate probe a concurrent default-home boot
-    could race.
+    could race — and from the conductor installers' own reports of whether
+    they wrote, for the same reason.
 
     Args:
         clean: If True, ignore existing config and regenerate from defaults.
         _wrote_out: private — when given, receives one bool: ``True`` after
-            the write landed and the whole function returned, ``False`` when
-            the shared-home guard refused. Pass a FRESH empty list: the
-            reader consumes the first element, so a reused list misreports.
+            every spec write landed and the whole function returned,
+            ``False`` when the shared-home guard refused, or when a conductor
+            installer left its spec on disk unwritten because the file could
+            not be read for a reason that may clear on retry
+            (``conductor_agents._governed_grants``) — in both cases an
+            ``allowedTools`` list on disk was NOT re-derived, so a moved
+            ceiling must stay pending rather than be marked projected. Pass a
+            FRESH empty list: the reader consumes the first element, so a
+            reused list misreports.
     """
     declined = _decline_shared_agent_home()
     if declined is not None:
@@ -3399,15 +3411,21 @@ def rebuild_agent_config(
     except Exception:
         logger.debug("kirocrew-heartbeat agent install failed", exc_info=True)
 
-    # Install kirocrew-conductor agent (goal decomposition + session-control dispatch)
+    # Install kirocrew-conductor agent (goal decomposition + session-control dispatch).
+    # ``clean`` is passed through: the conductor installers carry the user's own
+    # ``allowedTools`` entries forward across a rebuild, and a clean rebuild is the
+    # explicit reset that drops them, as it drops every customization above. Each
+    # reports whether it wrote: a spec left on disk because it could not be read
+    # is a list this rebuild did NOT re-derive, and ``_wrote_out`` must say so.
+    conductor_held = False
     try:
-        conductor_agents._install_conductor_agent()
+        conductor_held |= not conductor_agents._install_conductor_agent(clean=clean)
     except Exception:
         logger.debug("kirocrew-conductor agent install failed", exc_info=True)
 
     # Install kirocrew-pipeline-conductor agent (repository pipeline fleet supervision)
     try:
-        conductor_agents._install_pipeline_conductor_agent()
+        conductor_held |= not conductor_agents._install_pipeline_conductor_agent(clean=clean)
     except Exception:
         logger.debug("kirocrew-pipeline-conductor agent install failed", exc_info=True)
 
@@ -3420,13 +3438,13 @@ def rebuild_agent_config(
     # already running under the old name resolves it on every dispatch, which is
     # what the alias exists to keep working.
     try:
-        conductor_agents._install_ledger_conductor_agent()
+        conductor_held |= not conductor_agents._install_ledger_conductor_agent(clean=clean)
     except Exception:
         logger.debug("kirocrew-ledger-conductor alias install failed", exc_info=True)
 
     # Install kirocrew-security-conductor agent (one security audit's worker fleet)
     try:
-        conductor_agents._install_security_conductor_agent()
+        conductor_held |= not conductor_agents._install_security_conductor_agent(clean=clean)
     except Exception:
         logger.debug("kirocrew-security-conductor agent install failed", exc_info=True)
 
@@ -3460,7 +3478,10 @@ def rebuild_agent_config(
     repair_agent_configs()
 
     if _wrote_out is not None:
-        _wrote_out.append(True)
+        # ``False`` when a conductor spec was left on disk unwritten: its
+        # ``allowedTools`` were not re-derived, so the ceiling memo must not
+        # advance over it (see ``_wrote_out`` above).
+        _wrote_out.append(not conductor_held)
     return path
 
 
@@ -3666,16 +3687,20 @@ def require_fork_governance(agent: str | None, project_dir: str | Path | None = 
 def rebuild_agent_config_reporting() -> tuple[Path, bool]:
     """:func:`rebuild_agent_config`, reporting whether it actually wrote.
 
-    Returns ``(path, wrote)``. ``wrote`` is ``False`` exactly when the
-    shared-home guard refused the write — the one non-raising path that ends
-    with no spec written — and ``path`` is then the spec path that was NOT
-    rewritten. ``wrote=True`` additionally requires the WHOLE rebuild to have
-    returned: an exception after the write escapes instead, the memo a caller
-    keeps stays behind, and the next poll rewrites — the safe direction. The
-    verdict comes from the rebuild's own single guard evaluation, so no
-    caller-side probe exists for a concurrent default-home boot to race. A
-    caller needing ``clean`` uses :func:`rebuild_agent_config` directly — the
-    one consumer here (the ceiling-reprojection hook) never does.
+    Returns ``(path, wrote)``. ``wrote`` is ``False`` exactly when an
+    ``allowedTools`` list on disk was NOT re-derived by a rebuild that did not
+    raise: the shared-home guard refused the write (``path`` is then the spec
+    path that was NOT rewritten), or a conductor installer left its spec on
+    disk because the file could not be read for a reason that may clear on
+    retry (``conductor_agents._governed_grants``; the installer's own warning
+    names the file). ``wrote=True`` additionally requires the WHOLE rebuild to
+    have returned: an exception after the write escapes instead, the memo a
+    caller keeps stays behind, and the next poll rewrites — the safe
+    direction. The verdicts come from the rebuild's own single guard
+    evaluation and the installers' own reports, so no caller-side probe exists
+    for a concurrent default-home boot to race. A caller needing ``clean``
+    uses :func:`rebuild_agent_config` directly — the one consumer here (the
+    ceiling-reprojection hook) never does.
     """
     wrote_out: list[bool] = []
     path = rebuild_agent_config(_wrote_out=wrote_out)

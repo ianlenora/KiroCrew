@@ -917,7 +917,11 @@ rebuild it needed. And the memo advances **only after a confirmed write**: the h
 evaluation that gates the write. A failure still raises through the hook runner, which logs
 and moves on — and a **refused** rebuild (an instance the shared-home write guard declines:
 non-default `KIROCREW_HOME`, pod, or foreign-pinned specs) returns `wrote=False` and holds the
-memo the same way, logging the pending projection at WARNING once per generation. Either way,
+memo the same way, logging the pending projection at WARNING once per generation. So does a
+rebuild in which a conductor installer **left its spec on disk unwritten** because the file
+could not be read for a reason that may clear on retry (`conductor_agents._governed_grants`):
+that spec's `allowedTools` were not re-derived either, so the installers report whether they
+wrote and the rebuild folds a hold into the same `wrote=False`. Either way,
 marking the generation synchronised would lose the retry the next poll gives and leave
 forbidden auto-approvals on disk for the process lifetime; holding the memo means every later
 poll retries and the projection lands the moment the failure or refusal clears. The verdict
