@@ -3148,8 +3148,13 @@ def _attach_turn_stats(
     cost_usd: float,
     turn_boundary: int = 0,
     model: str = "",
-) -> None:
+    ttft_ms: int = 0,
+) -> bool:
     """Attach per-turn stats to the last assistant message's meta.
+
+    Returns whether a row received them, so a caller can tell a saved row from
+    a turn that had none (a denied tool with no text), whose recovery still has
+    to save it.
 
     Mirrors ``_flush_file_changes``: the meta lands on the in-memory message
     BEFORE ``_save_slot_to_history`` persists it, and reaches the live UI via
@@ -3161,8 +3166,11 @@ def _attach_turn_stats(
     this turn (``read_turn_model``): a concrete id on a pinned session, or the
     bare ``"auto"`` when the turn was handed to Auto and the backend disclosed
     no id for it — Auto's per-turn choice is not on the ACP wire, so ``"auto"``
-    is the whole of what can be said truthfully. Zero/empty fields are omitted
-    so the frontend renders only what the provider actually reported.
+    is the whole of what can be said truthfully. ``ttft_ms`` is the turn's
+    dispatch to first broadcast output latency (``_FirstVisibleClock``; queue
+    wait excluded), stored so it is readable without telemetry on.
+    Zero/empty fields are omitted so the frontend renders only what the
+    provider actually reported.
 
     ``turn_boundary`` is ``len(slot.messages)`` captured at turn start: only
     messages appended DURING this turn are candidates. Without it, an
@@ -3172,7 +3180,7 @@ def _attach_turn_stats(
     message or when there is nothing to show.
     """
     if elapsed_ms <= 0:
-        return
+        return False
     stats: dict[str, Any] = {"elapsed_ms": int(elapsed_ms)}
     if credits > 0:
         stats["credits"] = round(credits, 4)
@@ -3180,11 +3188,14 @@ def _attach_turn_stats(
         stats["cost_usd"] = round(cost_usd, 6)
     if model:
         stats["model"] = model
+    if ttft_ms > 0:
+        stats["ttft_ms"] = int(ttft_ms)
     boundary = max(0, turn_boundary)
     for m in reversed(slot.messages[boundary:]):
         if m.get("role") == "assistant":
             m.setdefault("meta", {})["turn_stats"] = stats
-            break
+            return True
+    return False
 
 
 def _mcp_server_name_is_ambiguous(server_name: str, safe_name: str) -> bool:
@@ -9950,6 +9961,62 @@ async def _finish_queue_cycle(
     summary_task.add_done_callback(state._background_tasks.discard)
 
 
+class _FirstVisibleClock:
+    """Turn dispatch -> first output that actually reaches the wire, in ms.
+
+    Starts where ``kirocrew.chat.first_token.duration`` starts, when
+    ``_run_chat`` begins the turn. A message sent while the slot is busy is
+    dispatched when the queue drains, so its wait in the queue is NOT counted:
+    that wait is set by the length of the turn ahead of it, not by this turn's
+    own path, and the value exists to measure the path.
+
+    Stops on the first NON-EMPTY broadcast, not on chunk receipt: the stream
+    redactors can withhold a whole first chunk until a later chunk or a flush,
+    so the receipt time would understate what the user waited. ``t0`` None
+    (a synthetic or nested prompt) never measures, leaving ``ms`` at 0.
+    ``clock`` must be the same clock ``t0`` was read from.
+    """
+
+    def __init__(self, t0: float | None, clock: Callable[[], float] = time.monotonic) -> None:
+        self._t0 = t0
+        self._clock = clock
+        self.ms = 0
+
+    def mark(self, wire: str) -> None:
+        if wire and self._t0 is not None:
+            self.ms = int((self._clock() - self._t0) * 1000.0)
+            self._t0 = None
+
+
+def _turn_clock(
+    slot: "_ChatSlot", t0: float | None, *, top_level: bool, recovery_turn: bool
+) -> _FirstVisibleClock:
+    """The first-token clock a top-level turn measures with.
+
+    Every top-level turn that does not reuse a clock stores the clock it
+    starts on the slot. A recovery turn of any rung (a replay, a
+    continuation, a requeue of either) skips its stats until one of them
+    saves the row, and it starts no clock of its own. So it reuses the slot's
+    clock object. If that clock already stopped, it keeps its reading. If it
+    never saw output (a tool-only turn), it is still running from the user
+    turn's start and stops at the recovery's first broadcast.
+
+    The stored clock is replaced when the next non-recovery turn starts, and
+    cleared when a top-level turn's stats actually land on a row (a turn with
+    no assistant row keeps it for its recovery). Every recovery turn
+    descends from the last non-recovery turn, so a reused clock always
+    belongs to the episode it is attached to. Nested prompts neither read nor
+    store it.
+    """
+    if not top_level:
+        return _FirstVisibleClock(t0)
+    if recovery_turn and slot._carried_ttft_clock is not None:
+        return slot._carried_ttft_clock
+    clock = _FirstVisibleClock(t0)
+    slot._carried_ttft_clock = clock
+    return clock
+
+
 def _emit_ttft_metric(t0: float, session_key: str, *, is_new: bool, resumed: bool) -> None:
     """Emit the user-message → first-visible-token latency histogram.
 
@@ -10523,6 +10590,22 @@ async def _run_chat(
     # synthetic payloads and nested prompts are runner-authored, and mixing
     # them in would skew the distribution the feature is judged by.
     _ttft_t0 = time.monotonic() if (_prompt_depth == 0 and not _synthetic_payload) else None
+    # Persisted twin of the clock above (same start, so queue wait is excluded),
+    # stopped at the first broadcast rather than at chunk receipt. A recovery
+    # turn may re-send the ORIGINAL payload, so ``_ttft_t0`` is live for the
+    # histogram, but the user message it would time from is the earlier turn's:
+    # it gets no start of its own and either reuses the carried clock or
+    # stores nothing.
+    _ttft_visible = _turn_clock(
+        slot,
+        None if _synthetic_recovery_turn else _ttft_t0,
+        top_level=_prompt_depth == 0,
+        recovery_turn=_synthetic_recovery_turn,
+    )
+    # Set when a steer cut persists text quietly (no frame): that text becomes
+    # visible only with the turn-end ``chat_done`` refresh, so the clock stops
+    # there unless a later broadcast stops it first.
+    _ttft_quiet_text = False
 
     # Inherit Slack link: if this dashboard session mirrors a Slack thread,
     # copy the link so every exit path, including an auth failure, can reply on
@@ -10767,6 +10850,7 @@ async def _run_chat(
         wire = _wsred.flush()
         if not wire:
             return
+        _ttft_visible.mark(wire)
         chunk_seq += 1
         slot._chunk_seq = chunk_seq
         # The window row carries the same seq (and process generation) as the
@@ -10790,6 +10874,7 @@ async def _run_chat(
         ends (any non-thinking event) or the turn completes. No-op when empty."""
         wire = _thinkred.flush()
         if wire:
+            _ttft_visible.mark(wire)
             state.broadcast_ws("chat_thinking", {"slot": slot.key, "content": wire})
 
     def _steer_segment_cut() -> None:
@@ -10814,7 +10899,7 @@ async def _run_chat(
         Sync on purpose — the handler and this turn share the event loop, so
         the flush cannot interleave with chunk processing.
         """
-        nonlocal assistant_text, _produced_visible_output
+        nonlocal assistant_text, _produced_visible_output, _ttft_quiet_text
         # Drop the wire redactor's withheld tail instead of emitting it: a
         # chat_chunk broadcast here would arrive AFTER the clients froze their
         # streaming message at the steer boundary, opening a phantom streaming
@@ -10823,6 +10908,10 @@ async def _run_chat(
         # _flush_segment persists (and re-redacts) that full text.
         _wsred.reset()
         if assistant_text.strip():
+            # The persisted row may hold text the redactor never broadcast (a
+            # fully withheld first chunk). It is published quietly, so it is
+            # timed at the turn-end refresh, not here.
+            _ttft_quiet_text = True
             # quiet_persist: the clients already hold this text in their
             # frozen (pre-steer) message; the append's chat_message broadcast
             # would render a duplicate copy below the steer bubble.
@@ -14083,6 +14172,7 @@ async def _run_chat(
                 # accumulates the full text for the authoritative final redaction.
                 wire = _wsred.feed(event.text)
                 if wire:
+                    _ttft_visible.mark(wire)
                     chunk_seq += 1
                     slot._chunk_seq = chunk_seq
                     # Same seq and generation on the window row as on the wire
@@ -14110,6 +14200,7 @@ async def _run_chat(
                 # thinking phase ends or the turn completes.
                 wire = _thinkred.feed(event.text)
                 if wire:
+                    _ttft_visible.mark(wire)
                     state.broadcast_ws(
                         "chat_thinking",
                         {"slot": slot.key, "content": wire},
@@ -18893,18 +18984,25 @@ async def _run_chat(
         # consumed credits vanish from the turn record. What it must NOT do is
         # record a
         # success or reset the retry budgets, which stays gated below.
+        if _ttft_quiet_text:
+            # Turn end: the chat_done refresh is what shows a quietly persisted
+            # steer segment. A no-op when a broadcast already stopped the clock.
+            _ttft_visible.mark("quiet")
         if not _retrying_empty:
             # Attach per-turn stats (elapsed / credits) to the last assistant
             # message so the footer can show them (parity with kiro-cli).
             # Scoped to this turn's messages via _turn_msg_boundary.
-            _attach_turn_stats(
+            _stats_attached = _attach_turn_stats(
                 slot,
                 _turn_elapsed_ms,
                 _turn_credits,
                 _turn_cost_usd,
                 turn_boundary=_turn_msg_boundary,
                 model=_turn_model,
+                ttft_ms=_ttft_visible.ms,
             )
+            if _prompt_depth == 0 and _stats_attached:
+                slot._carried_ttft_clock = None
             # Attach accumulated file changes to this turn's assistant row before persist
             _flush_file_changes(
                 slot, turn_boundary=_turn_msg_boundary, turn_start_mid=_turn_start_mid

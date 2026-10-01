@@ -2840,6 +2840,7 @@ class _ChatSlot:
         "_poisoned_reset_used",
         "_empty_response_retries",
         "_empty_episode_productive",
+        "_carried_ttft_clock",
         "_promise_only_retries",
         "_promise_only_stop_gen",
         "_promise_only_session_stop_gen",
@@ -3740,6 +3741,9 @@ class _ChatSlot:
         self._empty_response_retries: int = 0
         # True once any turn of the CURRENT empty-turn episode was productive.
         self._empty_episode_productive: bool = False
+        # First-token clock of the last top-level turn, reused by its recovery
+        # turns until one saves the row (``chat_runner._turn_clock``).
+        self._carried_ttft_clock: Any = None
         # One bounded synthetic continuation when a turn ended on a promise-only
         # final message (announced an immediate action, then yielded with no tool
         # call). Reset like the other per-turn retry budgets on a landed turn.
