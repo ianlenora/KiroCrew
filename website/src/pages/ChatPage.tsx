@@ -205,7 +205,13 @@ const TRANSCRIPT_TAIL_SPACER_PX = 16
  * line stops clear of the glass instead of under it. There is no opaque fade band
  * between the two any more — the transcript scrolls under the glass and the
  * material's own blur and tint are what keep the dock legible over it.
- * ChatPage.dockClearance.test.tsx pins the wiring.
+ *
+ * That holds for the composer alone. While the status stack above it holds a bar
+ * (the sub-agent tray, a task or workflow bar, a queued message), the scroller's
+ * box instead ENDS above the dock (`marginBottom: dockH`) and keeps only this
+ * clearance as padding: dense status rows over transcript text were unreadable
+ * in every theme, so the transcript never passes under them at any scroll
+ * position. ChatPage.dockClearance.test.tsx pins both wirings.
  */
 const DOCK_CLEARANCE_PX = 16
 /**
@@ -5100,6 +5106,21 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // painted frame already carries the right padding, where an effect-timed
   // measurement paints one frame with the last line under the glass, then jumps.
   const [dockH, setDockH] = useState(0)
+  // Whether the status stack above the composer (the sub-agent tray, the task
+  // and workflow bars, the queue cards) holds anything right now. The composer
+  // alone may float over the transcript: it is a sparse glass pane and the
+  // conversation reads through it. The stack may not: it is dense text, and a
+  // paragraph scrolling under the tray's rows collided with them in every
+  // theme, worst in glass mode where the tint is translucent. So while the
+  // stack is occupied the scroller ENDS above the dock (`marginBottom: dockH`)
+  // instead of running under it; the glass composer then sits on bare page.
+  // Read as "some child has rendered height", not the band's own height (its
+  // 11px padding/negative-margin pair for QueueStack's fuse leaves it 11px
+  // tall when empty) and not child presence (CommandCenterDock and QueueStack
+  // keep a zero-height wrapper mounted while they show nothing). Measured in
+  // the same callback as the height, since a bar mounting is exactly what
+  // resizes the dock.
+  const [statusStackOccupied, setStatusStackOccupied] = useState(false)
   // The scroller reserves a `scrollbar-gutter: stable` column on its right, and
   // its rows are centred in the content box that EXCLUDES that column. The dock
   // is inset by the same width, so its column lines up with the transcript's and
@@ -5111,9 +5132,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const dockRef = useCallback((el: HTMLDivElement | null) => {
     dockObserverRef.current?.disconnect()
     dockObserverRef.current = null
-    if (!el) { setDockH(0); setDockGutter(0); return }
+    if (!el) { setDockH(0); setDockGutter(0); setStatusStackOccupied(false); return }
     const measure = () => {
       setDockH(el.offsetHeight)
+      const band = el.querySelector<HTMLElement>('[data-testid="composer-status-stack"]')
+      setStatusStackOccupied(!!band && Array.from(band.children).some(c => (c as HTMLElement).offsetHeight > 0))
       const sc = scrollerRef.current
       setDockGutter(sc ? Math.max(0, sc.offsetWidth - sc.clientWidth) : 0)
     }
@@ -8587,7 +8610,20 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               <motion.div
                 key="welcome-hero"
                 layout
-                className="flex-1 flex flex-col items-center justify-center gap-6 px-8 min-h-0 overflow-y-auto"
+                // `isolate`: the hero is its own stacking context. WelcomeView
+                // layers its cards with z-indexes of its own (a hovered card
+                // grows over the next row at z-10, the Refresh link sits above
+                // that at z-20). The dock root deliberately has no z-index, and
+                // the composer inside it is z-10, so without a context here those
+                // values compared against the composer's and the Refresh link
+                // painted ON TOP of the input box whenever the hero scrolled
+                // under the dock. Inside its own context the hero's z-indexes
+                // order only the cards against each other, and the hero as a
+                // whole stays under the dock, which follows it in DOM order.
+                // `safe center`: when the welcome column is taller than this
+                // box (a phone, a short window), plain centring pushes its top
+                // out of scroll reach; safe centring falls back to the start.
+                className="isolate flex-1 flex flex-col items-center [justify-content:safe_center] gap-6 px-8 min-h-0 overflow-y-auto"
                 // The dock floats over this box too, so the padding keeps the
                 // hero centred in the visible strip rather than behind the glass.
                 style={{ paddingBottom: dockH }}
@@ -8620,17 +8656,29 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               virt={virt}
               loadingOlder={loadingOlder}
               spinnerNearTop={spinnerNearTop}
-              // The strip of the scroller the floating dock covers, plus
-              // DOCK_CLEARANCE_PX, alongside TRANSCRIPT_TAIL_SPACER_PX. Unlike
-              // the tail spacer this one also applies to a transcript short
-              // enough not to scroll, so both are needed for the last line to
-              // clear the dock in every state.
+              // Two geometries, picked by what the dock holds (`statusStackOccupied`,
+              // measured by `dockRef`):
+              // - Composer only: the strip of the scroller the floating dock
+              //   covers, plus DOCK_CLEARANCE_PX, alongside
+              //   TRANSCRIPT_TAIL_SPACER_PX. Unlike the tail spacer this one also
+              //   applies to a transcript short enough not to scroll, so both are
+              //   needed for the last line to clear the dock in every state.
+              // - A status bar is up: the scroller's BOX ends above the dock
+              //   (`marginBottom`), so the transcript never passes under the
+              //   sub-agent tray or the task bar at any scroll position; only the
+              //   clearance remains as padding. The dock still floats, over bare
+              //   page, and the composer keeps its glass.
               // `visibility` is not one of the properties the shell claims, so
               // adding it here is inside its documented contract. Hiding rather
               // than unmounting keeps the scroller's geometry and the height
               // cache intact -- the restore needs to WRITE scrollTop while this
               // is up, which a display:none element cannot do.
-              scrollerStyle={{ paddingBottom: dockH + DOCK_CLEARANCE_PX, ...(virt.restoreGate ? { visibility: 'hidden' as const } : null) }}
+              scrollerStyle={{
+                ...(statusStackOccupied
+                  ? { marginBottom: dockH, paddingBottom: DOCK_CLEARANCE_PX }
+                  : { paddingBottom: dockH + DOCK_CLEARANCE_PX }),
+                ...(virt.restoreGate ? { visibility: 'hidden' as const } : null),
+              }}
               aboveRows={<>
               {/* Mid-switch `slotHasMore` still describes the outgoing chat, so the cursor
                   key gates the bar to match the paging thunk's own precondition. */}
@@ -8806,7 +8854,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 runs the full height of the pane and the conversation scrolls
                 UNDER the glass (iOS toolbar layout). The scroller pays for the
                 covered strip with `paddingBottom: dockH + DOCK_CLEARANCE_PX`,
-                measured from this box by `dockRef`. No z-index here on purpose:
+                measured from this box by `dockRef` -- while the status stack
+                below is empty. Once it holds a bar the scroller's box ends above
+                this dock instead (`marginBottom: dockH`, same measurement), so
+                dense status rows never sit over transcript text; see
+                `statusStackOccupied`. No z-index here on purpose:
                 a positioned box with `z-index: auto` forms no stacking context,
                 so SubagentProgressBar's wave chip keeps its `z-[46]` against
                 the theme-experience overlays it was lifted to clear, and the

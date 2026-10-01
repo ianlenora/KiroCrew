@@ -340,6 +340,28 @@ carries its own anchors as well.
 The full owner map is in
 [history](../../docs/system-specs/modules/history.md#the-dashboard-transcript-window-frontend).
 
+### The composer dock and what may float over the transcript
+
+On the main chat page (`ChatPage.tsx`) the composer dock is one absolutely
+positioned box over the bottom of the transcript scroller (the iOS toolbar
+layout): the scroller runs the full height of the pane, the conversation scrolls
+under the composer's glass, and the scroller pays for the covered strip with
+`paddingBottom: dockH + DOCK_CLEARANCE_PX`, measured from the dock by a
+`ResizeObserver`. That scroll-under is for the composer alone. It is a sparse
+pane and the conversation stays readable through it; the status stack above it
+(the sub-agent tray, the task and workflow bars, the queue cards) is dense text,
+and a paragraph passing under its rows collided with them in every theme. So
+while that stack holds a bar the scroller's box ENDS above the dock
+(`marginBottom: dockH`) and the transcript never passes under it at any scroll
+position; the composer then floats over bare page. `statusStackOccupied` is the
+flag, read from the band's children in the same measurement; the geometry is
+pinned by `src/test/ChatPage.dockClearance.test.tsx`. The dock root carries no
+z-index of its own (`ChatPage.statusStackLayering.test.tsx` says why), so a
+sibling that scrolls under it must not lift its children with z-indexes that
+compare against the composer's: the welcome hero is `isolate` for exactly that
+reason, and a new scroll-under sibling takes the same class. The side-panel
+`ChatPane.tsx` keeps its bars in flow and needs none of this.
+
 ## Stat cards
 
 OPTIONAL summary metrics above the content. Add a row only when a number is not

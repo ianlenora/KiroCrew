@@ -158,7 +158,13 @@ export default function WelcomeView({ setInput }: WelcomeViewProps) {
     // Unprefixed = phones: a safe-centred column (falls back to top-aligned when it
     // overflows, so nothing clips). Short wide windows stack from the top. Wide and tall
     // viewports switch to the spread grid: greeting ~20% down, cards ~60%.
-    <div data-testid="welcome-layout" className="w-full flex-1 min-h-0 pt-12 pb-4 flex flex-col [justify-content:safe_center] sm:justify-start gap-6 [@media(min-width:640px)_and_(min-height:600px)]:pt-0 [@media(min-width:640px)_and_(min-height:600px)]:pb-0 [@media(min-width:640px)_and_(min-height:600px)]:grid [@media(min-width:640px)_and_(min-height:600px)]:grid-cols-1 [@media(min-width:640px)_and_(min-height:600px)]:grid-rows-[1.3fr_auto_0.7fr] [@media(min-width:640px)_and_(min-height:600px)]:gap-0">
+    // No `min-h-0`: this column sits in the page's hero scroller, which pads its
+    // bottom by the composer dock's height. The column has to GROW to its
+    // content for that padding to land after the Refresh row; shrunk to the
+    // scroller's height, the rows spilled past the padding as overflow the
+    // scroller did not count, so it could not scroll and the last row sat
+    // under the composer for good.
+    <div data-testid="welcome-layout" className="w-full flex-1 pt-12 pb-4 flex flex-col [justify-content:safe_center] sm:justify-start gap-6 [@media(min-width:640px)_and_(min-height:600px)]:pt-0 [@media(min-width:640px)_and_(min-height:600px)]:pb-0 [@media(min-width:640px)_and_(min-height:600px)]:grid [@media(min-width:640px)_and_(min-height:600px)]:grid-cols-1 [@media(min-width:640px)_and_(min-height:600px)]:grid-rows-[1.3fr_auto_0.7fr] [@media(min-width:640px)_and_(min-height:600px)]:gap-0">
       <div className="flex flex-col items-center w-full shrink-0 min-h-0">
         <div aria-hidden="true" className="hidden basis-[45%] shrink min-h-4 [@media(min-width:640px)_and_(min-height:600px)]:block" />
         <div className="flex flex-col items-center gap-3 text-center shrink-0">
