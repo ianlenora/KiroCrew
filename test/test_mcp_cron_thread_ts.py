@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from kiro_crew import mcp_cron
 from kiro_crew.cron import CronSchedule, CronService
 from kiro_crew.mcp_cron import _call_tool_inner, _call_tool_locally
 from kiro_crew.validation import (
@@ -122,9 +123,16 @@ class TestCronAddInheritsCallerThread:
         )()
 
     def test_slack_caller_thread_is_inherited(self, tmp_path: Path, monkeypatch) -> None:
-        # Caller runs in a Slack thread: session key is slack:<thread_ts>.
+        # Caller runs in a Slack thread: session key is slack:<thread_ts>, and
+        # its delivery channel resolves to the caller's own channel. A thread_ts
+        # is scoped to its channel, so the inherit requires the resolved channel
+        # to BE the caller's channel -- here the caller is in C0AP77JJSN6 and the
+        # cron targets that same channel.
         monkeypatch.setenv("KIROCREW_SESSION_KEY", "slack:1789696119.009399")
-        with patch("kiro_crew.mcp_cron.CronService") as mock_svc_cls:
+        with (
+            patch("kiro_crew.mcp_cron._caller_channel_id", return_value="C0AP77JJSN6"),
+            patch("kiro_crew.mcp_cron.CronService") as mock_svc_cls,
+        ):
             mock_svc = mock_svc_cls.return_value
             mock_svc.add_job.return_value = self._mock_job()
             _call_tool_locally(
@@ -183,6 +191,227 @@ class TestCronAddInheritsCallerThread:
                 kw = mock_svc.add_job.call_args.kwargs
                 assert kw.get("thread_ts") is None
                 assert kw.get("channel") is None
+
+    def test_explicit_cross_channel_does_not_inherit_caller_thread(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # A Slack caller running in thread 1789696119.009399 in its OWN channel
+        # schedules a cron into a DIFFERENT, explicitly named channel. The
+        # caller's thread is scoped to the caller's channel, so inheriting it
+        # into the other channel would name a thread that does not exist there --
+        # the job would post into an invalid thread forever. The thread must NOT
+        # be inherited across channels; the explicit channel still stands.
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "slack:1789696119.009399")
+        monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
+        with (
+            patch("kiro_crew.mcp_cron._caller_channel_id", return_value="C0CALLER0OWN"),
+            patch("kiro_crew.mcp_cron.CronService") as mock_svc_cls,
+        ):
+            mock_svc = mock_svc_cls.return_value
+            mock_svc.add_job.return_value = self._mock_job()
+            _call_tool_locally(
+                "cron_add",
+                {
+                    "name": "ops",
+                    "message": "check",
+                    "every": 300,
+                    "channel": "C0OTHERCHAN",  # explicit, != caller's own
+                    # no explicit thread_ts
+                },
+            )
+            kw = mock_svc.add_job.call_args.kwargs
+            assert kw.get("channel") == "C0OTHERCHAN", "explicit channel must be honored"
+            assert (
+                kw.get("thread_ts") is None
+            ), "caller thread must NOT be inherited into a different channel"
+
+    def test_explicit_same_channel_still_inherits_caller_thread(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # The guard above is scoped to a DIFFERENT channel: when the explicit
+        # channel equals the caller's own channel, the thread still inherits.
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "slack:1789696119.009399")
+        monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
+        with (
+            patch("kiro_crew.mcp_cron._caller_channel_id", return_value="C0SAME0CHAN"),
+            patch("kiro_crew.mcp_cron.CronService") as mock_svc_cls,
+        ):
+            mock_svc = mock_svc_cls.return_value
+            mock_svc.add_job.return_value = self._mock_job()
+            _call_tool_locally(
+                "cron_add",
+                {
+                    "name": "ops",
+                    "message": "check",
+                    "every": 300,
+                    "channel": "C0SAME0CHAN",  # explicit, == caller's own
+                },
+            )
+            kw = mock_svc.add_job.call_args.kwargs
+            assert kw.get("thread_ts") == "1789696119.009399", "same-channel inherit lost"
+
+
+class TestCronAddThreadInheritAcrossGateway:
+    """The thread inherit must survive the gateway hop.
+
+    The HTTP boundary rebuilds the ``CallerContext`` WITHOUT ``channel_id``
+    (dashboard/handlers/cron.py), so ``_caller_channel_id()`` is empty on the
+    gateway side and a same-channel comparison made there would always fail.
+    The inherit is therefore resolved on the RUNTIME side in ``_call_tool``
+    (where the caller channel is reliable) and forwarded to the gateway as an
+    explicit ``thread_ts`` argument. These tests drive ``_call_tool`` with a
+    mocked gateway ``_post`` and assert what it forwards -- the exact path the
+    GPT review found the original guard was inert on.
+    """
+
+    @staticmethod
+    def _forwarded_args(monkeypatch, *, caller_key: str, caller_channel: str, call_args: dict):
+        from kiro_crew.mcp_caller import CallerContext, set_current_caller
+
+        captured: dict = {}
+
+        def fake_post(path, payload, session_key=None):
+            captured["payload"] = payload
+            return {"result": "Added job abc"}
+
+        monkeypatch.setattr("kiro_crew.mcp_core._post", fake_post)
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", caller_key)
+        monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
+        set_current_caller(
+            CallerContext(
+                session_key=caller_key,
+                session_type=caller_key.partition(":")[0],
+                channel_id=caller_channel,
+                from_gateway=True,
+            )
+        )
+        try:
+            mcp_cron._call_tool("cron_add", call_args)
+        finally:
+            set_current_caller(None)
+        return captured["payload"]["arguments"]
+
+    def test_same_channel_thread_is_forwarded(self, monkeypatch) -> None:
+        # Caller in a Slack thread, cron targets the caller's own channel: the
+        # inherited thread_ts rides across the gateway as an explicit argument.
+        args = self._forwarded_args(
+            monkeypatch,
+            caller_key="slack:1789696119.009399",
+            caller_channel="C0CALLER0OWN",
+            call_args={
+                "name": "ops",
+                "message": "check",
+                "every": 300,
+                "channel": "C0CALLER0OWN",
+            },
+        )
+        assert args.get("thread_ts") == "1789696119.009399", "same-channel thread not forwarded"
+
+    def test_defaulted_channel_thread_is_forwarded(self, monkeypatch) -> None:
+        # No explicit channel: it defaults to the caller's own channel, so the
+        # thread is the caller's own and is forwarded.
+        args = self._forwarded_args(
+            monkeypatch,
+            caller_key="slack:1789696119.009399",
+            caller_channel="C0CALLER0OWN",
+            call_args={"name": "ops", "message": "check", "every": 300},
+        )
+        assert args.get("channel") == "C0CALLER0OWN", "caller channel not defaulted"
+        assert (
+            args.get("thread_ts") == "1789696119.009399"
+        ), "defaulted-channel thread not forwarded"
+
+    def test_cross_channel_thread_is_not_forwarded(self, monkeypatch) -> None:
+        # The GPT finding: caller in a thread in its own channel schedules a
+        # cron into a DIFFERENT explicit channel. The caller's thread does not
+        # exist in that other channel, so it must NOT be forwarded -- and this
+        # decision is made on the runtime side where the caller channel is
+        # known, so it holds even though the gateway side cannot see it.
+        args = self._forwarded_args(
+            monkeypatch,
+            caller_key="slack:1789696119.009399",
+            caller_channel="C0CALLER0OWN",
+            call_args={
+                "name": "ops",
+                "message": "check",
+                "every": 300,
+                "channel": "C0OTHERCHAN",  # explicit, != caller's own
+            },
+        )
+        assert args.get("channel") == "C0OTHERCHAN", "explicit channel must be honored"
+        assert "thread_ts" not in args or not args.get(
+            "thread_ts"
+        ), "caller thread must NOT be forwarded into a different channel"
+
+    def test_explicit_thread_ts_is_forwarded_unchanged(self, monkeypatch) -> None:
+        # An explicit thread_ts always wins and rides across unchanged, even
+        # cross-channel (the caller asked for it by name).
+        args = self._forwarded_args(
+            monkeypatch,
+            caller_key="slack:1789696119.009399",
+            caller_channel="C0CALLER0OWN",
+            call_args={
+                "name": "ops",
+                "message": "check",
+                "every": 300,
+                "channel": "C0OTHERCHAN",
+                "thread_ts": "1776298241.408339",
+            },
+        )
+        assert args.get("thread_ts") == "1776298241.408339", "explicit thread_ts overridden"
+
+    def test_non_slack_caller_forwards_no_thread(self, monkeypatch) -> None:
+        # Dashboard caller: no thread in the session key to inherit.
+        args = self._forwarded_args(
+            monkeypatch,
+            caller_key="dashboard:some-slot",
+            caller_channel="C0CALLER0OWN",
+            call_args={
+                "name": "ops",
+                "message": "check",
+                "every": 300,
+                "channel": "C0CALLER0OWN",
+            },
+        )
+        assert "thread_ts" not in args or not args.get(
+            "thread_ts"
+        ), "non-Slack caller must not forward a thread"
+
+    def test_non_string_thread_ts_does_not_raise_before_validation(self, monkeypatch) -> None:
+        # A model can emit a Slack ts as a JSON NUMBER. The runtime-side thread
+        # default must not call .strip() on a non-string before schema
+        # validation runs (that would raise AttributeError instead of a clean
+        # rejection): the non-string value is left untouched and forwarded as-is
+        # for the schema to reject downstream.
+        args = self._forwarded_args(
+            monkeypatch,
+            caller_key="slack:1789696119.009399",
+            caller_channel="C0CALLER0OWN",
+            call_args={
+                "name": "ops",
+                "message": "check",
+                "every": 300,
+                "channel": "C0CALLER0OWN",
+                "thread_ts": 1776298241.408339,  # non-string: must not crash here
+            },
+        )
+        # Left unchanged for schema rejection; the inherit path did not run.
+        assert args.get("thread_ts") == 1776298241.408339
+
+    def test_non_string_channel_does_not_raise_before_validation(self, monkeypatch) -> None:
+        # Same guard for a non-string channel: no pre-validation .strip() crash.
+        args = self._forwarded_args(
+            monkeypatch,
+            caller_key="slack:1789696119.009399",
+            caller_channel="C0CALLER0OWN",
+            call_args={
+                "name": "ops",
+                "message": "check",
+                "every": 300,
+                "channel": 12345,  # non-string: must not crash here
+            },
+        )
+        assert args.get("channel") == 12345
 
 
 class TestCronUpdateThreadTs:
