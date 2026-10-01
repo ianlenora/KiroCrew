@@ -880,6 +880,11 @@ class CronService:
                         last_run_ts=last_run_ts,
                         run_generation=generation,
                         result_produced=taken.started_monotonic is not None and job.result_produced,
+                        # A reaped run that started counts toward auto-pause, like
+                        # the wait_for timeout arm; one that never started does not.
+                        count_failure=taken.started_monotonic is not None
+                        and not job.failure_recorded
+                        and not job.run_never_started,
                     )
                 except Exception:
                     logger.exception("Reaper: failed to persist state for cron %s", job_id)
@@ -4193,6 +4198,7 @@ class CronService:
         last_run_ts: float,
         run_generation: int,
         result_produced: bool = False,
+        count_failure: bool = False,
     ) -> None:
         """Persist a job's terminal runtime state under the store lock.
 
@@ -4222,8 +4228,9 @@ class CronService:
         record would persist that run's success as the cancellation or timeout
         that came before it. Returning early here skips nothing owed: unlike
         ``_merge_job_result`` this helper writes only the three status fields
-        (plus clearing a command/script job's carried result), and the save
-        after them has nothing to record once they are skipped.
+        (plus clearing a command/script job's carried result, and the failure
+        count when ``count_failure``), and the save after them has nothing to
+        record once they are skipped.
         """
         with self._file_lock():
             self._sync()
@@ -4244,6 +4251,11 @@ class CronService:
             target.last_status = last_status
             target.last_error = last_error
             target.last_run_ts = last_run_ts
+            # Counted on the disk copy under the lock, so the failure count and
+            # any auto-pause it triggers persist with the terminal record.
+            counted = (target.enabled, target.auto_paused, target.consecutive_failures)
+            if count_failure:
+                target.record_failure()
             # A command/script run that produced nothing must not show the
             # previous run's result beside this error. The caller passes the
             # flag because a reload in _sync() drops the runtime-only marker.
@@ -4254,7 +4266,12 @@ class CronService:
             # cancel. An unreadable store must not abort the reaper loop.
             try:
                 self._save()
-            except CronStoreUnreadable as exc:
+            except Exception as exc:
+                # Keep scheduling as the disk says (like the loop-stall breaker):
+                # a pause the store did not take must not stop the job in memory.
+                target.enabled, target.auto_paused, target.consecutive_failures = counted
+                if not isinstance(exc, CronStoreUnreadable):
+                    raise
                 logger.warning("Cron terminal state not persisted: %s", exc)
 
     # ── Loop-stall breaker ──
