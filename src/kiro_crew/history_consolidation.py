@@ -46,6 +46,7 @@ from kiro_crew.vector_memory_constants import (
     _MAX_EPISODIC_PER_CONSOLIDATION,
     _MAX_LESSONS_PER_CONSOLIDATION,
     _MAX_SEMANTIC_PER_CONSOLIDATION,
+    _SEMANTIC_PROMPT_CAP_PER_CONSOLIDATION,
 )
 
 if TYPE_CHECKING:
@@ -76,6 +77,57 @@ _SKILL_DETECTION_WINDOW = 200
 #: Deferred rows are filled in by the standing repair sweep
 #: (``backfill_missing_embeddings``), which is what makes deferral lossless.
 _EMBED_BUDGET_SECS_PER_PASS = 60.0
+
+#: The one line under a bounded ``## Current Semantic Memory`` table. The prompt
+#: tells the model to update or delete the keys it can see, so a table that lost
+#: rows silently would read as "those facts do not exist" and invite a deletion
+#: of nothing or a near-duplicate of a dropped key. Same vocabulary as the chat
+#: path's startup omission notice, so a reader learns one shape.
+_SEMANTIC_OMISSION_NOTICE = (
+    "[Context budget: omitted {count} of {total} semantic rows above the "
+    "{limit}-character consolidation budget; the least recently updated rows were "
+    "left out. The table above is PARTIAL: a key you do not see may still exist, "
+    "so update or delete only keys listed above and treat a missing key as "
+    "unknown, not absent.]"
+)
+
+
+def _bounded_semantic_table(rows: list[dict], entries: list[dict], cap: int) -> tuple[str, int]:
+    """Render ``entries`` as the prompt's semantic table within ``cap`` characters.
+
+    ``rows`` are the store rows (in the store's key order) that ``entries`` were
+    rendered from, one to one. A table that fits renders whole and byte-identical
+    to the uncapped form. Over the cap, the most recently updated rows are kept
+    -- the order the chat path's ``semantic_cap`` reads without a query -- and
+    rendered in the same key order, so the block keeps its shape and only loses
+    its oldest rows. Returns the block and the number of rows left out.
+
+    The fit is found by bisection on the row count with the real renderer rather
+    than by an estimate per row, so the bound is exact for whatever ``indent``
+    and escaping produce, at the cost of O(log n) serialisations.
+    """
+    whole = json.dumps(entries, indent=1) if entries else "[]"
+    if len(whole) <= cap:
+        return whole, 0
+    # Newest first; key as the tiebreak so rows written in the same second keep
+    # one order across runs (a stable sort on top of the key order given).
+    by_recency = sorted(range(len(rows)), key=lambda i: str(rows[i].get("key", "")))
+    by_recency.sort(key=lambda i: str(rows[i].get("updated_at") or ""), reverse=True)
+
+    def _render(count: int) -> str:
+        kept = sorted(by_recency[:count])
+        return json.dumps([entries[i] for i in kept], indent=1) if kept else "[]"
+
+    fits, overflows = 0, len(rows)
+    rendered = "[]"
+    while overflows - fits > 1:
+        middle = (fits + overflows) // 2
+        candidate = _render(middle)
+        if len(candidate) <= cap:
+            fits, rendered = middle, candidate
+        else:
+            overflows = middle
+    return rendered, len(rows) - fits
 
 
 class _EmbedBudget:
@@ -1197,29 +1249,40 @@ class HistoryConsolidator:
                     current_semantic = await run_in_embed_pool(
                         vector_store.with_record_metadata, current_semantic
                     )
-                semantic_json = (
-                    json.dumps(
-                        [
+                semantic_entries = [
+                    {
+                        "key": e["key"],
+                        "value_json": _prompt_value(e),
+                        "confidence": e["confidence"],
+                        **(
                             {
-                                "key": e["key"],
-                                "value_json": _prompt_value(e),
-                                "confidence": e["confidence"],
-                                **(
-                                    {
-                                        "record_revision": e.get("record_revision", 0),
-                                        "metadata": e.get("record_metadata", {}),
-                                    }
-                                    if private_policy
-                                    else {}
-                                ),
+                                "record_revision": e.get("record_revision", 0),
+                                "metadata": e.get("record_metadata", {}),
                             }
-                            for e in current_semantic
-                        ],
-                        indent=1,
-                    )
-                    if current_semantic
-                    else "[]"
+                            if private_policy
+                            else {}
+                        ),
+                    }
+                    for e in current_semantic
+                ]
+                # The PROMPT's copy of the table is bounded; ``current_semantic``
+                # itself stays whole, because the writers below read it as the
+                # snapshot that decides update-versus-create and the revision a
+                # correction is checked against. Offloaded like the fetch: the
+                # fit is found by re-serialising a table that can run to
+                # megabytes, and this coroutine is on the gateway event loop.
+                semantic_json, semantic_omitted = await asyncio.to_thread(
+                    _bounded_semantic_table,
+                    current_semantic,
+                    semantic_entries,
+                    _SEMANTIC_PROMPT_CAP_PER_CONSOLIDATION,
                 )
+                if semantic_omitted:
+                    semantic_json += "\n" + _SEMANTIC_OMISSION_NOTICE.format(
+                        count=semantic_omitted,
+                        total=len(current_semantic),
+                        limit=_SEMANTIC_PROMPT_CAP_PER_CONSOLIDATION,
+                    )
                 semantic_fields = (
                     '"delete": false, "metadata": {"category": "contact", "subject": "user", '
                     '"predicate": "work_email", "scope": "", "source_ref": "brief evidence", '
