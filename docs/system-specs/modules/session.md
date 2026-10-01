@@ -363,7 +363,9 @@ prevent.
 
 Two conditions displace the cached `_bg_runtime`: a **backend switch** and
 **staleness** (`AcpRuntime._is_stale()` → `"age"` past 6h, or `"rss"` past
-500 MiB across the descendant tree). The displacement policy has ONE
+500 MiB across the descendant tree; on macOS each pid of that tree is measured
+by its `phys_footprint`, falling back to its `ps` RSS, because `ps` RSS omits the
+compressed and swapped pages an idle grown runtime mostly consists of). The displacement policy has ONE
 implementation, `_detach_bg_runtime_locked(runtime, cause, *, park_only=False)`:
 the runtime is
 killed if idle, and **parked on `_draining_bg_runtimes` if it has live or

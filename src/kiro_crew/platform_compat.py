@@ -1493,6 +1493,17 @@ _DARWIN_PROC_TASKINFO_SIZE = 96
 _DARWIN_PTI_TOTAL_USER_OFFSET = 16
 _DARWIN_PTI_TOTAL_SYSTEM_OFFSET = 24
 
+# ``proc_pid_rusage(pid, RUSAGE_INFO_V2, buf)`` fills a ``rusage_info_v2``: a
+# 16-byte ``ri_uuid`` followed by 18 uint64 fields, of which
+# ``ri_phys_footprint`` is the eighth (after user/system time, the two wakeup
+# counters, pageins, wired and resident size). Unlike ``proc_pidinfo`` it
+# returns 0/-1 rather than a byte count, so there is no fill size to check the
+# layout against here; test_macos_phys_footprint.py::TestTheRealDarwinAbi checks
+# the offsets against a live libproc on a Mac.
+_DARWIN_RUSAGE_INFO_V2 = 2
+_DARWIN_RUSAGE_INFO_V2_SIZE = 16 + 18 * 8
+_DARWIN_RI_PHYS_FOOTPRINT_OFFSET = 16 + 7 * 8
+
 _darwin_libproc: Any = None
 _darwin_libproc_loaded = False
 
@@ -1520,6 +1531,12 @@ def _darwin_libproc_handle() -> Any:
             ctypes.c_int,
         ]
         lib.proc_pidinfo.restype = ctypes.c_int
+        # Configured on its own: a libproc without this symbol must still
+        # serve every proc_pidinfo probe; only the footprint read goes dark.
+        rusage = getattr(lib, "proc_pid_rusage", None)
+        if rusage is not None:
+            rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+            rusage.restype = ctypes.c_int
         _darwin_libproc = lib
     except Exception:
         _darwin_libproc = None
@@ -1596,6 +1613,43 @@ def _darwin_process_start_identity(pid: int) -> ProcessStartIdentity | None:
         return ProcessStartIdentity(f"{sec}.{usec:06d}", ppid)
     except Exception:
         return None
+
+
+def _darwin_process_phys_footprint_bytes(pid: int) -> int | None:
+    """macOS ``phys_footprint`` of *pid* in bytes via ``proc_pid_rusage``.
+
+    The footprint is what jetsam acts on and what Activity Monitor's "Memory"
+    column shows: dirty anonymous memory INCLUDING its compressed and swapped
+    pages. ``ps`` RSS counts only what is resident right now, and on macOS an
+    idle process's grown heap is mostly compressed, so RSS can read a small
+    fraction of the real cost (16x measured on an operator Mac). Needs no
+    entitlement for a same-uid process and never spawns a subprocess.
+    """
+    lib = _darwin_libproc_handle()
+    rusage = getattr(lib, "proc_pid_rusage", None) if lib is not None else None
+    if rusage is None:
+        return None
+    try:
+        buf = ctypes.create_string_buffer(_DARWIN_RUSAGE_INFO_V2_SIZE)
+        if rusage(pid, _DARWIN_RUSAGE_INFO_V2, buf) != 0:
+            return None
+        off = _DARWIN_RI_PHYS_FOOTPRINT_OFFSET
+        # Both x86_64 and arm64 macOS are little-endian.
+        return int.from_bytes(buf.raw[off : off + 8], "little")
+    except Exception:
+        return None
+
+
+def proc_phys_footprint_bytes_for_pid(pid: int) -> int | None:
+    """``phys_footprint`` of *pid* in bytes on macOS; None elsewhere or unreadable.
+
+    The macOS memory figure the runtime ceilings judge by (see
+    ``_darwin_process_phys_footprint_bytes``). Other platforms have no
+    equivalent and answer None, so a caller keeps its own RSS reading there.
+    """
+    if not IS_MACOS:
+        return None
+    return _darwin_process_phys_footprint_bytes(pid)
 
 
 def _darwin_process_start_microtime(pid: int) -> str | None:
