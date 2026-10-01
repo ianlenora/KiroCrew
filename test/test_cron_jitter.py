@@ -326,14 +326,24 @@ class TestJitterWaitEndsOnWallClock:
 
     @pytest.mark.asyncio
     async def test_no_suspend_waits_the_full_jitter(self):
-        """With no suspend and no clock step the wait is the jitter, as before."""
+        """With no suspend and no clock step the wait is the jitter, as before.
+
+        Measured on ``perf_counter``, not ``monotonic``: on Windows
+        ``monotonic`` ticks in ~15.6 ms steps, so a wait that really lasted
+        50 ms can read as 47 ms. The helper may end on either deadline, so the
+        tolerance is one tick of the coarser of the two clocks it reads.
+        """
         import time as time_mod
 
         from kiro_crew.cron import _sleep_out_jitter
 
-        start = time_mod.monotonic()
+        tick = max(
+            time_mod.get_clock_info("monotonic").resolution,
+            time_mod.get_clock_info("time").resolution,
+        )
+        start = time_mod.perf_counter()
         await _sleep_out_jitter(0.05)
-        assert time_mod.monotonic() - start >= 0.05
+        assert time_mod.perf_counter() - start >= 0.05 - tick
 
     @pytest.mark.asyncio
     async def test_scheduled_run_waits_through_the_wall_clock_helper(self):
