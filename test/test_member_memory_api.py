@@ -54,6 +54,29 @@ def _close_standalone_vector(state) -> None:
         standalone.close()
 
 
+def _cli_spawn_request(env, *, session="", extra_headers=None):
+    """``kirocrew spawn run``'s request: the internal secret, a task, nothing else."""
+    return request(
+        env,
+        body={"task": "spawn"},
+        internal=True,
+        session=session,
+        extra_headers=extra_headers,
+    )
+
+
+def _spawn_recorder(env) -> mock.Mock:
+    spawn = mock.Mock(return_value=SimpleNamespace(id="run-1", done=False))
+    env.state.subagents = SimpleNamespace(spawn=spawn)
+    return spawn
+
+
+def _host_process(monkeypatch, verdict: bool) -> None:
+    from kiro_crew import member_memory_auth
+
+    monkeypatch.setattr(member_memory_auth, "local_owner_bootstrap_allowed", lambda _r: verdict)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("target", ["", "bob"])
 async def test_spawn_inherits_member_or_uses_explicit_target(env, target):
@@ -62,9 +85,7 @@ async def test_spawn_inherits_member_or_uses_explicit_target(env, target):
     cfg = loader.KiroCrewConfig.load()
     cfg.agents["bob"].triggers = "review"
     cfg.save()
-    env.state.subagents = SimpleNamespace(
-        spawn=mock.Mock(return_value=SimpleNamespace(id="run-1", done=False))
-    )
+    _spawn_recorder(env)
     response = await messaging.api_spawn(
         request(
             env,
@@ -111,23 +132,42 @@ async def test_internal_spawn_parent_must_match_caller_identity(
 
 
 @pytest.mark.asyncio
-async def test_identityless_internal_spawn_without_parent_is_admitted(env):
-    """``kirocrew spawn run`` sends no X-Session-Key and no parent_session.
-
-    That caller is a verified Global identity; its absent session and its empty
-    claimed parent both mean "no session" and must not read as a mismatch.
-    """
+async def test_host_cli_spawn_without_session_or_parent_is_admitted(env, monkeypatch):
+    """The host operator's CLI claims no session, so it is not a mismatch."""
     from kiro_crew.dashboard.handlers import messaging
 
-    env.state.subagents = SimpleNamespace(
-        spawn=mock.Mock(return_value=SimpleNamespace(id="run-1", done=False))
-    )
-    response = await messaging.api_spawn(
-        request(env, body={"task": "spawn"}, internal=True, session="")
-    )
+    _host_process(monkeypatch, True)
+    spawn = _spawn_recorder(env)
+    response = await messaging.api_spawn(_cli_spawn_request(env))
     assert response.status == 200, response.text
-    env.state.subagents.spawn.assert_called_once()
-    assert not env.state.subagents.spawn.call_args.kwargs.get("memory_store")
+    spawn.assert_called_once()
+    assert not spawn.call_args.kwargs.get("memory_store")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "session, extra_headers, host_process",
+    [
+        ("", {}, False),
+        ("", {"X-Internal-Caller": "kirocrew-core"}, True),
+        ("dashboard:alice", {}, True),
+    ],
+    ids=["not_a_host_process", "session_unbound_mcp_caller", "session_bearing_caller"],
+)
+async def test_parentless_spawn_that_is_not_the_host_cli_is_refused(
+    env, monkeypatch, session, extra_headers, host_process
+):
+    """A sandboxed shell, a named MCP server, or a caller with a session stays a 409."""
+    from kiro_crew.dashboard.handlers import messaging
+
+    _host_process(monkeypatch, host_process)
+    spawn = _spawn_recorder(env)
+    response = await messaging.api_spawn(
+        _cli_spawn_request(env, session=session, extra_headers=extra_headers)
+    )
+    assert response.status == 409, response.text
+    assert json.loads(response.text)["code"] == "member_identity_unavailable"
+    spawn.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -184,6 +184,7 @@ def make_request(
     match_info: dict[str, str] | None = None,
     attested: bool = True,
     session_token: str = "",
+    extra_headers: dict[str, str] | None = None,
 ) -> web.Request:
     """A mocked dashboard request against *state* in one of the authenticated shapes.
 
@@ -198,13 +199,13 @@ def make_request(
     arrives with in production; ``attested=False`` is the bare-header shape a
     process that merely holds the internal secret can produce. *session_token*
     sends ``X-Session-Token``, the other attestation an internal caller can
-    carry.
+    carry. *extra_headers* adds further headers (``X-Internal-Caller``, say).
     """
     method = method or ("POST" if body is not None else "GET")
     target = f"{path}?{urlencode(query)}" if query else path
     app = web.Application()
     app["state"] = state
-    headers = {"X-Session-Key": session}
+    headers = {"X-Session-Key": session, **(extra_headers or {})}
     if session_token:
         headers["X-Session-Token"] = session_token
     kwargs: dict[str, Any] = {}
@@ -235,6 +236,7 @@ def request(
     session="dashboard:alice",
     attested=True,
     session_token="",
+    extra_headers=None,
 ):
     """``make_request`` against ``env.state``: POST ``/api/memory/seed`` with a body, else GET recall."""
     path = "/api/memory/seed" if body is not None else "/api/memory/recall"
@@ -248,6 +250,7 @@ def request(
         session=session,
         attested=attested,
         session_token=session_token,
+        extra_headers=extra_headers,
     )
 
 

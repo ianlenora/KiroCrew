@@ -1807,6 +1807,18 @@ Posts to the dashboard API on the configured `--port`. By default it polls until
 the run finishes and prints the result; `--async` returns immediately with the
 subagent ID. `kirocrew spawn list` lists current runs.
 
+The CLI sends the internal secret and nothing else: no `X-Session-Key`, no
+`parent_session` and no `X-Internal-Caller`. An internal-secret request of that
+shape from a host peer process (`member_memory_auth.local_owner_bootstrap_allowed`)
+is the host operator: it claims no session and runs with no parent, on Global
+memory unless it names a target member. Every other parentless internal request
+must name the caller's own session, so it gets 409 `member_identity_unavailable`.
+That includes an MCP stdio server that lost its session, because every MCP stdio
+server names itself in `X-Internal-Caller`, and a sandboxed agent shell running
+the CLI, which fails the host-process check. With the sandbox off, an agent's
+shell is a host process and is indistinguishable from the operator's CLI.
+`messaging._is_host_cli_spawn` is the predicate.
+
 ### MCP Tool: `spawn_run`
 
 Exposed via `kirocrew-core` MCP server. Always fire-and-forget — results
