@@ -2423,6 +2423,17 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
   mask-image:linear-gradient(to bottom,transparent,black 16px,black calc(100% - 16px),transparent);
   -webkit-mask-image:linear-gradient(to bottom,transparent,black 16px,black calc(100% - 16px),transparent)}
 
+/* Bottom-edge fade on the expanded pinned-prompt paragraph while it still has
+   content below its visible edge (pages/chat/PinnedPrompt.tsx sets and clears
+   the class from the scroll position). A functional mask, not a fill (see
+   docs/theming-contract.md "Fills are flat"): without it the ceiling-capped
+   card cut its last visible line with nothing to say "more below", and read as
+   a rendering defect rather than a scroll region. Bottom only — a top fade
+   would dim the first line the reader is on. */
+.pinned-scroll-more{
+  mask-image:linear-gradient(to bottom,black calc(100% - 20px),transparent);
+  -webkit-mask-image:linear-gradient(to bottom,black calc(100% - 20px),transparent)}
+
 /* ── Table row striping ── */
 .table-striped tbody tr:nth-child(even){background:var(--card-hl)}
 
