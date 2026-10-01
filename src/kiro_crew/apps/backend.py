@@ -864,7 +864,9 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
                 app_name,
             )
             return None
-        cmd = [node_bin, entry_str]
+        # The resolved path: Node's ESM main-module guard compares the realpath-resolved
+        # import.meta.url with argv[1], so a symlinked path makes it silently never fire.
+        cmd = [node_bin, str(entry.resolve())]
         cwd = str(root)
         # Pass PORT as env var — Node.js apps typically read process.env.PORT
         env["NODE_ENV"] = "production"
