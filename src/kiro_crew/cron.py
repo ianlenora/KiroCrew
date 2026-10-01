@@ -125,6 +125,7 @@ from kiro_crew.cron_service.readers import (  # noqa: F401 -- re-exported
 from kiro_crew.cron_service.schedule import (  # noqa: F401 -- re-exported
     _JITTER_DAILY_MAX,
     _JITTER_HOURLY_MAX,
+    _JITTER_WALL_SLICE_SECS,
     _MAX_SKIP_DATE_HORIZON_SECS,
     _MAX_SKIP_DATE_LOOKAHEAD,
     _RE_IN_DURATION,
@@ -372,6 +373,38 @@ _REAPER_RESET_TIMEOUT = 30.0  # max seconds for session reset in reaper
 #: round is a named kill failure, audited ``failed``, never ``reaped``. Each
 #: round spends at most ``_REAPER_RESET_TIMEOUT`` plus the kill's own bounds.
 _ENDING_ROUNDS = 2
+
+
+async def _sleep_out_jitter(jitter: float) -> None:
+    """Wait ``jitter`` seconds before a scheduled run, ending on the wall clock too.
+
+    Jitter is a spread on the WALL-CLOCK fire time ("start somewhere in the
+    59 minutes after 09:00"). A bare ``asyncio.sleep(jitter)`` measures it on
+    the event loop's clock, ``time.monotonic()``, which on macOS is
+    ``mach_absolute_time`` and stops while the host sleeps. A daily job that
+    fires in a two-second DarkWake therefore waits out its jitter in AWAKE
+    seconds only: hours of wall time later it is still waiting, the dashboard
+    shows it Running (the run holds its claim through the wait), it has
+    written no in-flight marker or history row, and its next run has already
+    moved to tomorrow.
+
+    The wait ends at whichever deadline comes FIRST:
+
+    - the wall-clock deadline, so suspended time counts and a resumed host
+      starts the run within one ``_JITTER_WALL_SLICE_SECS`` slice;
+    - the monotonic deadline, so a backward wall-clock step (NTP, a manual
+      clock change) can never stretch the wait past the old behaviour.
+
+    Cancellation is unchanged: a ``cancel()`` lands at the slice's
+    ``asyncio.sleep`` exactly as it landed at the single sleep before.
+    """
+    wall_deadline = time.time() + jitter
+    mono_deadline = time.monotonic() + jitter
+    while True:
+        remaining = min(wall_deadline - time.time(), mono_deadline - time.monotonic())
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(remaining, _JITTER_WALL_SLICE_SECS))
 
 
 # ── Loop-safety guard ───────────────────────────────────────────────────────
@@ -3704,7 +3737,7 @@ class CronService:
             # would ever consume it.
             if jitter > 0:
                 logger.debug("Cron: applying %.0fs jitter to job '%s'", jitter, job.name)
-                await asyncio.sleep(jitter)
+                await _sleep_out_jitter(jitter)
             exec_started_at = time.time()
             # The record a hard exit leaves behind. Every other trace of this
             # run (last_run_ts, the history row, status) is written in the

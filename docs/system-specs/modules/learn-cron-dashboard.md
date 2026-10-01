@@ -348,6 +348,8 @@ Jobs can define `skip_dates` — a list of dates (YYYY-MM-DD) on which the job s
 
 Jobs receive random jitter by default (0-5min hourly, 0-59min daily) to spread load. Sub-hourly schedules receive no jitter: intervals shorter than one hour, and cron expressions whose parsed minute field fires more than once per hour. The cron parser expands and deduplicates wildcard, step, list, range, and combined forms; a single literal minute keeps the existing hourly, multi-hour, or daily band selected from the hour field. Set `strict_schedule: true` on a job to disable jitter entirely — the job fires at the exact cron/interval time.
 
+The jitter wait (`_sleep_out_jitter` in `cron.py`) is a spread on the **wall-clock** fire time, so it ends at whichever comes first: the wall-clock deadline or the monotonic one. It sleeps in slices of at most `_JITTER_WALL_SLICE_SECS` (30 s), rechecking both clocks after each slice. The wall-clock deadline is what counts host-suspend time. On macOS `time.monotonic()` is `mach_absolute_time` and stops while the machine sleeps, so a bare `asyncio.sleep(jitter)` let a daily job fired in a brief DarkWake wait out its jitter in awake seconds only. That held it as Running for hours, with no in-flight marker, no history row and `next_run` already moved past it. A resumed host now starts the run within one slice. The monotonic deadline means a backward wall-clock step can never stretch the wait past `jitter`. The reaper's `jitter_allowance` is unchanged: the wait's monotonic length is at most `jitter`.
+
 ### Create-path persistence-owner validation (`timezone` / `skip_dates`)
 
 `CronService.add_job()`/`update_job()` in `cron.py` are the **persistence
